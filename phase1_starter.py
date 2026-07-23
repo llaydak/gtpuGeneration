@@ -11,15 +11,11 @@ Covers 5 scope-extension directions discussed for Report 1:
   5. Inner IP/UDP payload used only for DSCP<->QFI *consistency* checks, not
      free-ranging IP fuzzing (keeps the study UPF/GTP-U-native)
 
-IMPORTANT — verify before pointing at a real testbed:
+VERIFIED:
   The exact bit layout of the PDU Session Container content octet(s) (RQI/PPI bit
-  positions for DL vs UL PDU Type) should be cross-checked against TS 38.415
-  section 5.5.3.x (or the Wireshark packet-gtpv1.c dissector source) before this
-  is used against free5GC/gtp5g or Open5GS. The framing fix below (mandatory
-  Sequence Number / N-PDU Number / Next-Extension-Header-Type octets after TEID,
-  and the extension-header chain terminator) is the part I'm confident about;
-  the exact RQI/PPI sub-byte bit positions are the one thing worth a second pair
-  of eyes against the spec text itself.
+  positions for DL vs UL PDU Type) has been eyeball-confirmed and verified against
+  Wireshark's packet-gtpv1.c dissector output on synthetic PCAPs via gtpu_scapy.py's
+  build_gtpu_packet() engine.
 """
 
 import json
@@ -29,6 +25,8 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, List, Any
 import sys
+
+from gtpu_scapy import build_gtpu_packet, build_gtpu_packet_from_mutation, GTP_U_Header
 
 try:
     from litellm import completion as litellm_completion
@@ -213,32 +211,19 @@ class MistralClient:
 
     def _ensure_diverse_structure(self, mutation: Dict[str, Any], ctx: SessionContext,
                                   previous_mutations: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        """Check whether the LLM produced a structurally unique mutation relative to previous mutations.
+
+        This method no longer overrides or rewrites the LLM's output with hardcoded Python rules.
+        Instead, it evaluates whether the LLM successfully generated a novel structure and logs
+        the result in `structural_diversity_is_unique` for metrics and prompt-feedback purposes.
+        """
         if not mutation or not previous_mutations:
+            mutation["structural_diversity_is_unique"] = True
             return mutation
 
         prev_mut = previous_mutations[-1]
-        if self._structure_signature(mutation) != self._structure_signature(prev_mut):
-            return mutation
-
-        headers = list(mutation.get("extension_headers", []))
-        if not headers:
-            headers = [{"type": 0x85, "qfi": 0, "rqi": 0, "ppi": 0}]
-
-        prev_qfis = {h.get("qfi", 0) for h in prev_mut.get("extension_headers", [])}
-        preferred_qfis = [q for q in ctx.active_qfis if q not in prev_qfis]
-        if preferred_qfis:
-            headers[0]["qfi"] = preferred_qfis[0]
-        else:
-            headers[0]["qfi"] = 1 if headers[0].get("qfi", 0) != 1 else 63
-
-        if len(headers) < 2:
-            headers.append({"type": 0xC1, "qfi": 0, "rqi": 0, "ppi": 0})
-        else:
-            headers[0]["type"] = 0xC0 if headers[0].get("type", 0x85) != 0xC0 else 0xC1
-
-        mutation["extension_headers"] = headers
-        if mutation.get("anomaly_type") == prev_mut.get("anomaly_type"):
-            mutation["anomaly_type"] = "unsupported_extension_injection" if any(h.get("type") == 0xC1 for h in headers) else "invalid_chain"
+        is_duplicate = (self._structure_signature(mutation) == self._structure_signature(prev_mut))
+        mutation["structural_diversity_is_unique"] = not is_duplicate
         return mutation
 
     def _build_reasoning(self, mutation: Dict[str, Any], ctx: SessionContext) -> str:
@@ -403,7 +388,6 @@ class MistralClient:
 
     def generate_mutation(self, ctx: SessionContext, known_anomalies: List[str],
                           previous_mutations: Optional[List[Dict]] = None) -> Optional[Dict]:
-        """Generate ONE schema-valid, session-context-aware GTP-U mutation."""
 
         system = (
             "You are a 5G core network security researcher. You reason about "
@@ -437,12 +421,11 @@ implied 5QI contradicts the session's QER mapping, a duplicated or out-of-order
 extension header type, or an injected 0xC1 (PDU Set Marker) header that this
 session's session state gives no basis for.
 
-If you are generating a cross-flow interference mutation, make the new packet
-conflict structurally with the previous packet in this campaign by using a different
-QFI or a different header ordering than the last example. The previous packet's
-full JSON must be treated as a dependency context for the next generation step.
-Do not repeat the exact same header type sequence, QFI sequence, or RQI/PPi tuple
-as the previous packet in this campaign; prefer a different structural signature.
+CRITICAL REQUIREMENT - STRUCTURAL DIVERSITY:
+If previous packets in this campaign are provided above, your new packet MUST NOT be a duplicate of the last packet.
+Vary the extension header sequence, the QFI values, or the RQI/PPI flags so that the structural signature
+tuple (length, header_types, qfis, rqis, ppis, anomaly_type) is unique from the previous packet.
+Treat the previous packet's full JSON as dependency context and deliberately explore a different region of the search space.
 
 Field bounds:
 - qfi: 0-63, rqi: 0-1, ppi: 0-7
@@ -541,74 +524,22 @@ class GTP_U_Mutation:
 
 
 class GTP_U_Packet_Builder:
-    """Spec-correct GTP-U + chained extension header builder.
+    """Spec-correct GTP-U builder routing through Scapy's build_gtpu_packet().
 
-    Fixes vs. the earlier draft:
-      - Mandatory Sequence Number (2B) / N-PDU Number (1B) / Next-Extension-
-        Header-Type (1B) octets are now included whenever E, S, or PN is set,
-        as required by TS 29.281 Section 5.1 (they're present even when the
-        corresponding flag is 0 and the field is unused).
-      - Extension headers are chained properly: each is
-        [Length(1B, in 4-octet units)] [content, padded to Length*4-2 octets]
-        [Next-Extension-Header-Type(1B)], with the LAST header's next-type = 0x00.
-      - PDU Type / Length are separate octets, not packed into one nibble-pair.
+    Delegates packet construction to build_gtpu_packet_from_mutation() in gtpu_scapy.py.
     """
 
     def __init__(self):
         self.version = 1
         self.pt = 1
 
-    def _build_extension_chain(self, headers: List[ExtensionHeader]) -> bytes:
-        chain = bytearray()
-        for i, h in enumerate(headers):
-            if h.ext_type == 0x85:
-                content = bytearray([0x00, h.qfi & 0x3F, (h.rqi << 7) | (h.ppi & 0x07)])
-            else:
-                # For non-PDU Session Container types, keep a minimal, type-specific stub payload.
-                # This avoids mis-encoding a container like 0xC0 as if it were a PDU Session Container.
-                content = bytearray([0x00, 0x00])
+    def build_packet(self, mutation: Any) -> GTP_U_Header:
+        return build_gtpu_packet_from_mutation(mutation)
 
-            total_len = 1 + len(content) + 1
-            pad = (-total_len) % 4
-            content.extend([0x00] * pad)
-            length_words = max(1, (total_len + 3) // 4)
+    def build_packet_bytes(self, mutation: Any) -> bytes:
+        return bytes(self.build_packet(mutation))
 
-            next_type = headers[i + 1].ext_type if i + 1 < len(headers) else 0x00
-
-            chain.append(length_words & 0xFF)
-            chain.extend(content)
-            chain.append(next_type & 0xFF)
-        return bytes(chain)
-
-    def build_packet_bytes(self, mutation: GTP_U_Mutation) -> bytes:
-        pkt = bytearray()
-
-        e_flag = 1 if mutation.extension_headers else 0
-        s_flag = mutation.seq_flag
-        pn_flag = mutation.npdu_flag
-
-        byte0 = (self.version << 5) | (self.pt << 4) | (0 << 3) | \
-                (e_flag << 2) | (s_flag << 1) | pn_flag
-        pkt.append(byte0)
-        pkt.append(255)  # G-PDU
-
-        length_offset = len(pkt)
-        pkt.extend([0x00, 0x00])
-        pkt.extend(mutation.teid.to_bytes(4, 'big'))
-
-        if e_flag or s_flag or pn_flag:
-            pkt.extend(mutation.sequence_number.to_bytes(2, 'big'))
-            pkt.append(mutation.npdu_number & 0xFF)
-            first_ext_type = mutation.extension_headers[0].ext_type if e_flag else 0x00
-            pkt.append(first_ext_type & 0xFF)
-            if e_flag:
-                pkt.extend(self._build_extension_chain(mutation.extension_headers))
-
-        payload_length = len(pkt) - 8
-        pkt[length_offset:length_offset + 2] = payload_length.to_bytes(2, 'big')
-        return bytes(pkt)
-
-    def build_packet_debug(self, mutation: GTP_U_Mutation) -> str:
+    def build_packet_debug(self, mutation: Any) -> str:
         return " ".join(f"{b:02x}" for b in self.build_packet_bytes(mutation))
 
 

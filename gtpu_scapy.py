@@ -81,6 +81,76 @@ def build_gtpu_packet(
 	return packet
 
 
+def extract_container_kwargs(mutation_or_dict: Any) -> Dict[str, Any]:
+	"""Adapter converting a GTP_U_Mutation instance, dictionary, or raw header dict
+	(e.g., {"qfi": x, "rqi": y, "ppi": z}) into kwargs accepted by build_gtpu_packet().
+	"""
+	kwargs: Dict[str, Any] = {}
+
+	if isinstance(mutation_or_dict, dict):
+		if "teid" in mutation_or_dict:
+			kwargs["teid"] = mutation_or_dict["teid"]
+		if "sequence_number" in mutation_or_dict:
+			kwargs["sequence_number"] = mutation_or_dict["sequence_number"]
+		if "npdu_number" in mutation_or_dict:
+			kwargs["npdu_number"] = mutation_or_dict["npdu_number"]
+		if "pdu_type" in mutation_or_dict:
+			kwargs["pdu_type"] = mutation_or_dict["pdu_type"]
+
+		for key in ("qfi", "rqi", "ppi", "QFI", "RQI", "PPI"):
+			if key in mutation_or_dict:
+				kwargs[key] = mutation_or_dict[key]
+
+		ext_headers = mutation_or_dict.get("extension_headers", [])
+		for h in ext_headers:
+			if isinstance(h, dict):
+				ext_type = h.get("type", h.get("ext_type"))
+				if ext_type == PDU_SESSION_CONTAINER_TYPE:
+					for key in ("qfi", "rqi", "ppi", "QFI", "RQI", "PPI"):
+						if key in h and key not in kwargs:
+							kwargs[key] = h[key]
+					if "pdu_type" in h and "pdu_type" not in kwargs:
+						kwargs["pdu_type"] = h["pdu_type"]
+			elif hasattr(h, "ext_type") and getattr(h, "ext_type") == PDU_SESSION_CONTAINER_TYPE:
+				for key in ("qfi", "rqi", "ppi"):
+					if hasattr(h, key) and key not in kwargs:
+						kwargs[key] = getattr(h, key)
+	else:
+		if hasattr(mutation_or_dict, "teid"):
+			kwargs["teid"] = getattr(mutation_or_dict, "teid")
+		if hasattr(mutation_or_dict, "sequence_number"):
+			kwargs["sequence_number"] = getattr(mutation_or_dict, "sequence_number")
+		if hasattr(mutation_or_dict, "npdu_number"):
+			kwargs["npdu_number"] = getattr(mutation_or_dict, "npdu_number")
+		if hasattr(mutation_or_dict, "pdu_type"):
+			kwargs["pdu_type"] = getattr(mutation_or_dict, "pdu_type")
+
+		ext_headers = getattr(mutation_or_dict, "extension_headers", [])
+		for h in ext_headers:
+			ext_type = getattr(h, "ext_type", getattr(h, "type", None))
+			if ext_type == PDU_SESSION_CONTAINER_TYPE:
+				for key in ("qfi", "rqi", "ppi"):
+					if hasattr(h, key) and key not in kwargs:
+						kwargs[key] = getattr(h, key)
+				if hasattr(h, "pdu_type") and "pdu_type" not in kwargs:
+					kwargs["pdu_type"] = getattr(h, "pdu_type")
+
+	return kwargs
+
+
+def build_gtpu_packet_from_mutation(
+	mutation_or_dict: Any,
+	payload: Optional[Packet | bytes] = None,
+	**override_kwargs: Any,
+) -> GTP_U_Header:
+	"""Build a GTP-U Scapy packet from a GTP_U_Mutation object or dictionary."""
+	kwargs = extract_container_kwargs(mutation_or_dict)
+	kwargs.update(override_kwargs)
+	if "teid" not in kwargs:
+		kwargs["teid"] = 0
+	return build_gtpu_packet(payload=payload, **kwargs)
+
+
 def decode_gtpu_packet(data: bytes) -> GTP_U_Header:
 	"""Decode bytes and require a GTP-U packet with a PDU Session Container."""
 	packet = GTP_U_Header(data)
@@ -96,5 +166,8 @@ __all__ = [
 	"GTP_U_Header",
 	"PDU_SESSION_CONTAINER_TYPE",
 	"build_gtpu_packet",
+	"build_gtpu_packet_from_mutation",
+	"extract_container_kwargs",
 	"decode_gtpu_packet",
 ]
+
