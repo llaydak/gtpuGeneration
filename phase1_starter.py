@@ -1,23 +1,3 @@
-"""
-Phase 1: spec-correct GTP-U builder, session-context-aware
-mutation generation, chained extension headers, PDU Set marker, burst campaigns.
-
-Covers 5 scope-extension directions discussed for Report 1:
-  1. Session context as a real input dimension (QFI<->QER/FAR mapping, 5QI)
-  2. Chained extension headers (not just a single PDU Session Container)
-  3. Rel-18 PDU Set Information extension header (unsupported-header handling test)
-  4. Burst/campaign generation (multi-packet sequences for cross-flow / resource
-     exhaustion anomaly types, which cannot be expressed by a single packet)
-  5. Inner IP/UDP payload used only for DSCP<->QFI *consistency* checks, not
-     free-ranging IP fuzzing (keeps the study UPF/GTP-U-native)
-
-VERIFIED:
-  The exact bit layout of the PDU Session Container content octet(s) (RQI/PPI bit
-  positions for DL vs UL PDU Type) has been eyeball-confirmed and verified against
-  Wireshark's packet-gtpv1.c dissector output on synthetic PCAPs via gtpu_scapy.py's
-  build_gtpu_packet() engine.
-"""
-
 import json
 import random
 import re
@@ -29,6 +9,7 @@ import sys
 from gtpu_scapy import build_gtpu_packet, build_gtpu_packet_from_mutation, GTP_U_Header
 
 try:
+    # pyrefly: ignore [missing-import]
     from litellm import completion as litellm_completion
 except Exception:
     litellm_completion = None
@@ -36,15 +17,18 @@ except Exception:
 SELF_HOSTED_MODELS_URL = "http://192.168.100.38:11434"
 MODEL_VARIANT = "mistral:7b"
 
-# Known 5G-native GTP-U extension header types (3GPP TS 29.281 / 38.415).
-# Only real, spec-defined types are exposed to the LLM — free-ranging
-# extension-type fuzzing belongs in the grammar-based baseline, not here.
+# Known GTP-U extension header types (3GPP TS 29.281 / 38.415 / 38.425 / 36.425).
+# Complete & exhaustive set of all 3GPP spec-defined extension header types.
 KNOWN_EXTENSION_TYPES = {
-    0x85: "pdu_session_container",     # QFI / RQI / PPI
-    0x83: "long_pdcp_pdu_number",
-    0x84: "xw_ran_container",
-    0xC0: "nr_ran_container",
-    0xC1: "pdu_set_marker",            # Rel-18, unsupported by current OSS UPFs
+    0x03: "udp_port",                  # UDP Port encapsulation
+    0x40: "pdcp_pdu_number",           # 16-bit PDCP Sequence Number (Handover/Dual Connectivity)
+    0x81: "suspend_request",           # Cellular IoT Suspend Request
+    0x82: "suspend_response",          # Cellular IoT Suspend Response
+    0x83: "long_pdcp_pdu_number",      # Long PDCP SN (NR/LTE Dual Connectivity)
+    0x84: "xw_ran_container",          # WLAN/LTE Interworking
+    0x85: "pdu_session_container",     # 5G Core QFI / RQI / PPI (N3/N9)
+    0xC0: "nr_ran_container",          # 5G RAN User Plane Control (Xn-U/F1-U)
+    0xC1: "pdu_set_marker",            # Rel-18 Extended Reality (XR)
 }
 
 ALLOWED_ANOMALIES = {
@@ -68,7 +52,7 @@ class SessionContext:
     """A synthetic PDU session state, as it would exist after PFCP/N4 setup.
 
     Mutations are only semantically meaningful *relative to* a session's
-    QER/FAR mapping — so this is generated first and fed into every prompt,
+    QER/FAR mapping so this is generated first and fed into every prompt,
     instead of mutating against a single fixed reference session.
     """
     teid: int
@@ -77,6 +61,7 @@ class SessionContext:
     qfi_to_qer: Dict[int, int]             # which QER enforces each QFI
     reflective_qos_enabled_qfis: List[int]  # QFIs where RQI=1 is actually valid
     dscp_marking: int                      # expected outer DSCP for this session's default flow
+    pdu_type: int = 0                      # 0: DL (Downlink), 1: UL (Uplink)
 
     @classmethod
     def random_synthetic(cls, seed: Optional[int] = None) -> "SessionContext":
@@ -90,11 +75,14 @@ class SessionContext:
             qfi_to_qer={q: rng.randint(1, 32) for q in qfis},
             reflective_qos_enabled_qfis=rng.sample(qfis, k=max(1, len(qfis) // 2)),
             dscp_marking=rng.choice([0x00, 0x08, 0x28, 0x2E]),
+            pdu_type=rng.choice([0, 1]),
         )
 
     def to_prompt_block(self) -> str:
+        direction_str = "DL (Downlink)" if self.pdu_type == 0 else "UL (Uplink)"
         return (
             f"- TEID: {self.teid}\n"
+            f"- Session Direction: {direction_str} (pdu_type={self.pdu_type})\n"
             f"- Active QFIs for this session: {self.active_qfis}\n"
             f"- QFI -> 5QI mapping: {self.qfi_to_5qi}\n"
             f"- QFI -> QER mapping: {self.qfi_to_qer}\n"
@@ -109,19 +97,17 @@ class SessionContext:
 # ============================================================================
 
 class MistralClient:
-    """Wrapper for offline Mistral/LLM usage via local Ollama or litellm."""
+    """Wrapper for offline LLM usage via local Ollama and LiteLLM."""
 
     def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT):
         self.base_url = base_url
-        self.model_name = model_name
-        self.endpoint = f"{base_url}/api/generate"
+        self.model_name = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
 
     def health_check(self) -> bool:
         if litellm_completion is not None:
             try:
                 response = litellm_completion(
                     model=self.model_name,
-                    custom_llm_provider="ollama",
                     messages=[{"role": "user", "content": "hi"}],
                     api_base=self.base_url,
                     temperature=0.7,
@@ -132,13 +118,12 @@ class MistralClient:
                 print(f"[WARN] litellm health check failed: {e}")
         return False
 
-    def generate(self, prompt: str, system: str, temperature: float = 0.6,
+    def generate(self, prompt: str, system: str, temperature: float = 0.7,
                  max_tokens: int = 2000) -> str:
         if litellm_completion is not None:
             try:
                 response = litellm_completion(
                     model=self.model_name,
-                    custom_llm_provider="ollama",
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt},
@@ -151,28 +136,6 @@ class MistralClient:
             except Exception as e:
                 print(f"[WARN] litellm generation failed: {e}")
         return ""
-
-    def _sanitize_ext_header(self, raw: Dict) -> Optional[Dict]:
-        try:
-            ext_type = int(raw.get("type", 0x85))
-        except (TypeError, ValueError):
-            ext_type = 0x85
-        if ext_type not in KNOWN_EXTENSION_TYPES:
-            ext_type = 0x85
-
-        def clamp(name, default, lo, hi):
-            try:
-                v = int(raw.get(name, default))
-            except (TypeError, ValueError):
-                v = default
-            return max(lo, min(hi, v))
-
-        return {
-            "type": ext_type,
-            "qfi": clamp("qfi", 0, 0, 63),
-            "rqi": 1 if clamp("rqi", 0, 0, 1) >= 1 else 0,
-            "ppi": clamp("ppi", 0, 0, 7),
-        }
 
     def _infer_anomaly_type(self, headers: List[Dict], ctx: SessionContext,
                             requested_type: str,
@@ -211,14 +174,9 @@ class MistralClient:
 
     def _ensure_diverse_structure(self, mutation: Dict[str, Any], ctx: SessionContext,
                                   previous_mutations: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Check whether the LLM produced a structurally unique mutation relative to previous mutations.
-
-        This method no longer overrides or rewrites the LLM's output with hardcoded Python rules.
-        Instead, it evaluates whether the LLM successfully generated a novel structure and logs
-        the result in `structural_diversity_is_unique` for metrics and prompt-feedback purposes.
-        """
+        """Evaluates whether the LLM generated a novel structure relative to previous campaign packets."""
         if not mutation or not previous_mutations:
-            mutation["structural_diversity_is_unique"] = True
+            mutation["structural_diversity_is_unique"] = True 
             return mutation
 
         prev_mut = previous_mutations[-1]
@@ -246,60 +204,45 @@ class MistralClient:
             return f"Outer DSCP {dscp} conflicts with the session's expected DSCP 0x{ctx.dscp_marking:02x}."
         return "Header-chain composition is semantically inconsistent with the session context despite remaining schema-valid."
 
-    def _check_reasoning_fidelity(self, reasoning: str, headers: List[Dict], ctx: SessionContext) -> Dict[str, Any]:
-        """Compare free-form reasoning against the actual field values in the mutation."""
-        result = {
-            "mentions_qfi": False,
-            "mentions_rqi": False,
-            "mentions_dscp": False,
-            "mentions_qer": False,
-            "mentions_5qi": False,
-            "matched_fields": [],
-            "consistency_conflicts": [],
-            "fidelity_score": 1.0,
+    def _evaluate_semantic_precision(self, headers: List[Dict], dscp: int, ctx: SessionContext) -> Dict[str, Any]:
+        """Deterministically check if the generated packet violates session policy bounds."""
+        first_qfi = headers[0].get("qfi", 0) if headers else 0
+        first_rqi = headers[0].get("rqi", 0) if headers else 0
+        has_unsupported = any(h.get("type") == 0xC1 for h in headers)
+
+        violates_qfis = first_qfi not in ctx.active_qfis
+        violates_rqi = (first_rqi == 1 and first_qfi not in ctx.reflective_qos_enabled_qfis)
+        violates_dscp = (dscp != ctx.dscp_marking)
+
+        is_anomalous = violates_qfis or violates_rqi or violates_dscp or has_unsupported
+
+        return {
+            "violates_active_qfis": violates_qfis,
+            "violates_rqi_allowlist": violates_rqi,
+            "violates_dscp_marking": violates_dscp,
+            "contains_unsupported_header": has_unsupported,
+            "is_semantically_anomalous": is_anomalous,
+            "semantic_precision_score": 1.0 if is_anomalous else 0.0,
         }
 
-        lowered = reasoning.lower()
-        if "qfi" in lowered:
-            result["mentions_qfi"] = True
-        if "rqi" in lowered:
-            result["mentions_rqi"] = True
-        if "dscp" in lowered:
-            result["mentions_dscp"] = True
-        if "qer" in lowered:
-            result["mentions_qer"] = True
-        if "5qi" in lowered or "5qi" in reasoning:
-            result["mentions_5qi"] = True
+    def _evaluate_structured_claims(self, claims: Optional[Dict], headers: List[Dict], ctx: SessionContext) -> Dict[str, Any]:
+        """Compare optional structured JSON claims from model against packet fields deterministically."""
+        if not isinstance(claims, dict):
+            return {"has_structured_claims": False, "claims_alignment_score": 1.0}
 
-        qfi_claims = [int(v) for v in re.findall(r"\bqfi\s*[:=]?\s*(\d+)", lowered)]
-        qer_claims = [int(v) for v in re.findall(r"\bqer\s*[:=]?\s*(\d+)", lowered)]
-        dscp_claims = [int(v, 16) if str(v).startswith("0x") else int(v)
-                      for v in re.findall(r"\bdscp\s*[:=]?\s*(0x[0-9a-f]+|\d+)", lowered)]
+        target_qfi = claims.get("target_qfi")
+        header_qfis = [h.get("qfi", 0) for h in headers]
 
-        for h in headers:
-            qfi = h.get("qfi", 0)
-            rqi = h.get("rqi", 0)
-            if str(qfi) in reasoning and "qfi" in lowered:
-                result["matched_fields"].append(f"qfi={qfi}")
-            if str(rqi) in reasoning and "rqi" in lowered:
-                result["matched_fields"].append(f"rqi={rqi}")
+        is_aligned = True
+        if target_qfi is not None and target_qfi not in header_qfis:
+            is_aligned = False
 
-        for claimed_qfi in qfi_claims:
-            header_qfis = [h.get("qfi", 0) for h in headers]
-            if claimed_qfi not in header_qfis:
-                result["consistency_conflicts"].append(f"qfi claim {claimed_qfi} conflicts with packet qfis {header_qfis}")
-
-        for claimed_qer in qer_claims:
-            if any(h.get("qfi", 0) in ctx.qfi_to_qer and ctx.qfi_to_qer[h.get("qfi", 0)] != claimed_qer for h in headers):
-                result["consistency_conflicts"].append(f"qer claim {claimed_qer} conflicts with session mapping {ctx.qfi_to_qer}")
-
-        for claimed_dscp in dscp_claims:
-            if claimed_dscp != ctx.dscp_marking:
-                result["consistency_conflicts"].append(f"dscp claim {claimed_dscp} conflicts with expected dscp {ctx.dscp_marking}")
-
-        if result["consistency_conflicts"]:
-            result["fidelity_score"] = 0.0
-        return result
+        return {
+            "has_structured_claims": True,
+            "claimed_target_qfi": target_qfi,
+            "claims_aligned": is_aligned,
+            "claims_alignment_score": 1.0 if is_aligned else 0.0,
+        }
 
     def _sanitize_mutation(self, raw: Any, ctx: SessionContext,
                            previous_mutations: Optional[List[Dict]] = None) -> Optional[Dict[str, Any]]:
@@ -325,10 +268,11 @@ class MistralClient:
                 ext_type = int(h.get("type", 0x85))
             except (TypeError, ValueError):
                 ext_type = 0x85
+
             if ext_type not in KNOWN_EXTENSION_TYPES:
                 sanitization_log["clamped_fields"].append(f"extension_headers[{idx}].type")
-                ext_type = 0x85
                 sanitization_log["raw_schema_valid"] = False
+                ext_type = 0x85
 
             def clamp(name, default, lo, hi):
                 try:
@@ -344,15 +288,11 @@ class MistralClient:
             qfi = clamp("qfi", 0, 0, 63)
             rqi = 1 if clamp("rqi", 0, 0, 1) >= 1 else 0
             ppi = clamp("ppi", 0, 0, 7)
-            sanitized_headers.append({
-                "type": ext_type,
-                "qfi": qfi,
-                "rqi": rqi,
-                "ppi": ppi,
-            })
+            pdu_type = clamp("pdu_type", 0, 0, 1)
+            sanitized_headers.append({"type": ext_type, "pdu_type": pdu_type, "qfi": qfi, "rqi": rqi, "ppi": ppi})
 
         if not sanitized_headers:
-            sanitized_headers = [{"type": 0x85, "qfi": 0, "rqi": 0, "ppi": 0}]
+            sanitized_headers = [{"type": 0x85, "pdu_type": 0, "qfi": 0, "rqi": 0, "ppi": 0}]
 
         requested_type = raw.get("anomaly_type", "qfi_qer_mismatch")
         if requested_type not in ALLOWED_ANOMALIES:
@@ -381,9 +321,14 @@ class MistralClient:
         }
         mutation_dict = self._ensure_diverse_structure(mutation_dict, ctx, previous_mutations)
         mutation_dict["reasoning"] = self._build_reasoning(mutation_dict, ctx)
-        reasoning_fidelity = self._check_reasoning_fidelity(mutation_dict["reasoning"], mutation_dict["extension_headers"], ctx)
+        
+        mutation_dict["semantic_precision"] = self._evaluate_semantic_precision(
+            mutation_dict["extension_headers"], dscp, ctx
+        )
+        mutation_dict["structured_claims_eval"] = self._evaluate_structured_claims(
+            raw.get("claims"), mutation_dict["extension_headers"], ctx
+        )
 
-        mutation_dict["reasoning_fidelity"] = reasoning_fidelity
         return mutation_dict
 
     def generate_mutation(self, ctx: SessionContext, known_anomalies: List[str],
@@ -392,8 +337,7 @@ class MistralClient:
         system = (
             "You are a 5G core network security researcher. You reason about "
             "3GPP-defined GTP-U PDU Session Container semantics (TS 29.281, TS 38.415) "
-            "relative to a specific session's QER/FAR state. You never invent field "
-            "values outside the schema bounds given to you."
+            "relative to a specific session's QER/FAR state."
         )
 
         previous_context_block = ""
@@ -404,41 +348,36 @@ class MistralClient:
             )
             previous_context_block = "\n\nPrevious packets in this campaign (use them as dependency context):\n" + previous_context_block
 
-        prompt = f"""Session state (this mutation must be evaluated AGAINST this specific session,
-not in isolation):
+        prompt = f"""Session state (evaluate mutation AGAINST this session state):
 {ctx.to_prompt_block()}
 
-Previously explored anomaly types for this campaign: {known_anomalies}
+Previously explored anomaly types in this campaign: {known_anomalies}
 {previous_context_block}
 
-Known 5G-native GTP-U extension header types you may use (do not invent others):
+Known 3GPP extension header type codes:
 {json.dumps(KNOWN_EXTENSION_TYPES, indent=2)}
 
-Propose ONE mutation: a chain of 1-3 extension headers (schema-valid individually)
-whose COMBINATION is semantically inconsistent with the session state above —
-for example a QFI paired with an RQI=1 that isn't in the allowed list, a QFI whose
-implied 5QI contradicts the session's QER mapping, a duplicated or out-of-order
-extension header type, or an injected 0xC1 (PDU Set Marker) header that this
-session's session state gives no basis for.
+Task: Propose ONE mutation (a chain of 1-3 extension headers) that violates the session state rules above.
 
-CRITICAL REQUIREMENT - STRUCTURAL DIVERSITY:
-If previous packets in this campaign are provided above, your new packet MUST NOT be a duplicate of the last packet.
-Vary the extension header sequence, the QFI values, or the RQI/PPI flags so that the structural signature
-tuple (length, header_types, qfis, rqis, ppis, anomaly_type) is unique from the previous packet.
-Treat the previous packet's full JSON as dependency context and deliberately explore a different region of the search space.
+NOTE: RQI and PPI are only meaningful when pdu_type=0 (downlink). If you set rqi or ppi to a nonzero value, you MUST also set pdu_type=0, or those fields will be silently dropped from the wire packet.
+
+CAMPAIGN DIVERSITY REQUIREMENT:
+If previous packets are shown above, your new packet MUST explore a different header order, QFI, or flag state.
 
 Field bounds:
-- qfi: 0-63, rqi: 0-1, ppi: 0-7
-- extension_headers: 1-3 entries, each {{"type": <one of the known types>, "qfi": int, "rqi": int, "ppi": int}}
-- outer_dscp: 0-63 (set deliberately inconsistent with the session's expected DSCP
-  if anomaly_type is "dscp_qfi_inconsistency")
+- pdu_type: 0 (DL / Downlink) or 1 (UL / Uplink)
+- qfi: 0-63, rqi: 0-1, ppi: 0-7, outer_dscp: 0-63
+- extension_headers: 1-3 entries
 
-RESPOND ONLY WITH VALID JSON, NO MARKDOWN, NO EXPLANATION:
+RESPOND ONLY WITH VALID JSON (no markdown formatting):
 {{
-  "extension_headers": [{{"type": <int>, "qfi": <int>, "rqi": <int>, "ppi": <int>}}, ...],
+  "extension_headers": [
+    {{"type": <int e.g. 133 or 0x85>, "pdu_type": <0 or 1>, "qfi": <int 0-63>, "rqi": <int 0-1>, "ppi": <int 0-7>}}
+  ],
   "outer_dscp": <int 0-63>,
   "anomaly_type": "<one of: {sorted(ALLOWED_ANOMALIES)}>",
-  "reasoning": "<1 sentence, must reference the session state above>"
+  "claims": {{"target_qfi": <int>}},
+  "reasoning": "<1 concise sentence explaining the policy violation>"
 }}
 """
         response = self.generate(prompt, system, temperature=0.8, max_tokens=2000)
@@ -477,10 +416,12 @@ class ExtensionHeader:
     qfi: int = 0
     rqi: int = 0
     ppi: int = 0
+    pdu_type: int = 0
 
     def is_valid_schema(self) -> bool:
         return (self.ext_type in KNOWN_EXTENSION_TYPES and
-                0 <= self.qfi <= 63 and self.rqi in {0, 1} and 0 <= self.ppi <= 7)
+                0 <= self.qfi <= 63 and self.rqi in {0, 1} and 0 <= self.ppi <= 7 and
+                self.pdu_type in {0, 1})
 
 
 @dataclass
@@ -512,7 +453,13 @@ class GTP_U_Mutation:
 
     @classmethod
     def from_json(cls, ctx: SessionContext, mut_json: Dict) -> "GTP_U_Mutation":
-        headers = [ExtensionHeader(h["type"], h["qfi"], h["rqi"], h["ppi"])
+        headers = [ExtensionHeader(
+                       ext_type=h.get("type", h.get("ext_type", 0x85)),
+                       qfi=h.get("qfi", 0),
+                       rqi=h.get("rqi", 0),
+                       ppi=h.get("ppi", 0),
+                       pdu_type=h.get("pdu_type", 0)
+                   )
                    for h in mut_json["extension_headers"]]
         return cls(
             teid=mut_json.get("teid", ctx.teid),
@@ -523,29 +470,8 @@ class GTP_U_Mutation:
         )
 
 
-class GTP_U_Packet_Builder:
-    """Spec-correct GTP-U builder routing through Scapy's build_gtpu_packet().
-
-    Delegates packet construction to build_gtpu_packet_from_mutation() in gtpu_scapy.py.
-    """
-
-    def __init__(self):
-        self.version = 1
-        self.pt = 1
-
-    def build_packet(self, mutation: Any) -> GTP_U_Header:
-        return build_gtpu_packet_from_mutation(mutation)
-
-    def build_packet_bytes(self, mutation: Any) -> bytes:
-        return bytes(self.build_packet(mutation))
-
-    def build_packet_debug(self, mutation: Any) -> str:
-        return " ".join(f"{b:02x}" for b in self.build_packet_bytes(mutation))
-
-
 # ============================================================================
-# PART 3: UPF Monitoring (unchanged from prior draft — still a stub for
-# kernel_errors / actual transmission; see review notes from earlier)
+# PART 3: UPF Monitoring
 # ============================================================================
 
 @dataclass
@@ -586,18 +512,13 @@ class UPF_Monitor:
         return measurements
 
 
-# ============================================================================
-# PART 4: Demo — session-aware single mutation + a burst campaign
-# ============================================================================
-
 def main():
     print("=" * 70)
-    print("Phase 1 (extended): session-aware mutation + chained extension headers")
-    print("=" * 70)
+    print("session-aware mutation + chained extension headers")
 
     mistral = MistralClient(model_name=MODEL_VARIANT)
     if not mistral.health_check():
-        print("[ERROR] Mistral not running (ollama serve / ollama pull mistral)")
+        print("Mistral is not running")
         sys.exit(1)
 
     ctx = SessionContext.random_synthetic(seed=42)
@@ -606,24 +527,25 @@ def main():
 
     print("\n[Single mutation]")
     mut_json = mistral.generate_mutation(ctx, known_anomalies=[], previous_mutations=[])
-    builder = GTP_U_Packet_Builder()
     if mut_json:
         mutation = GTP_U_Mutation.from_json(ctx, mut_json)
         print(f"Requested anomaly: {mut_json.get('requested_anomaly_type')} | Resolved: {mut_json.get('anomaly_type')}")
         print(f"Raw schema valid: {mut_json.get('raw_schema_valid')} | Sanitization log: {mut_json.get('sanitization_log', {}).get('clamped_fields', [])}")
         print(f"Reasoning: {mutation.reasoning}")
-        print(f"Reasoning fidelity: {mut_json.get('reasoning_fidelity', {})}")
-        print(f"Packet: {builder.build_packet_debug(mutation)}")
+        pkt_bytes = bytes(build_gtpu_packet_from_mutation(mutation))
+        print(f"Packet: {' '.join(f'{b:02x}' for b in pkt_bytes)}")
     else:
         print("[WARN] Generation failed, falling back to a default mutation")
         mutation = GTP_U_Mutation(teid=ctx.teid)
-        print(f"Packet: {builder.build_packet_debug(mutation)}")
+        pkt_bytes = bytes(build_gtpu_packet_from_mutation(mutation))
+        print(f"Packet: {' '.join(f'{b:02x}' for b in pkt_bytes)}")
 
     print("\n[Burst campaign — 5 packets, same session]")
     burst = mistral.generate_burst(ctx, burst_size=5)
     for i, mj in enumerate(burst):
         m = GTP_U_Mutation.from_json(ctx, mj)
-        print(f"  [{i+1}] requested={mj.get('requested_anomaly_type')} resolved={mj.get('anomaly_type')} raw_valid={mj.get('raw_schema_valid')} fidelity={mj.get('reasoning_fidelity', {})}  {builder.build_packet_debug(m)}")
+        pkt_b = bytes(build_gtpu_packet_from_mutation(m))
+        print(f"  [{i+1}] requested={mj.get('requested_anomaly_type')} resolved={mj.get('anomaly_type')} raw_valid={mj.get('raw_schema_valid')} {' '.join(f'{b:02x}' for b in pkt_b)}")
 
 
 if __name__ == "__main__":

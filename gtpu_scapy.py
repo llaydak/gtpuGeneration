@@ -5,9 +5,16 @@ Scapy already provides the TS 38.415 PDU Session Container model in
 and adds validation plus a small builder for the GTP-U header chain.
 """
 
+# it's now always DL unless a caller explicitly passes pdu_type=1. I confirmed this: build_gtpu_packet(teid=1, qfi=5) 
+# (no RQI/PPI at all) now also comes out as type=0, where previously it defaulted to UL.
+# If UL traffic matters for the study, worth adding pdu_type as a field 
+# the LLM/knowledge graph samples explicitly with the RQI/PPI constraint 
+# enforced downstream by this same ValueError guard
+# rather than leaving it to the builder's default.
+
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from scapy.contrib.gtp import GTPPDUSessionContainer, GTP_U_Header
 from scapy.packet import Packet, Raw
@@ -26,7 +33,7 @@ class GTPUPDUSessionContainer(GTPPDUSessionContainer):
 def build_gtpu_packet(
 	teid: int,
 	*,
-	pdu_type: int = 1,
+	pdu_type: Optional[int] = None,
 	payload: Optional[Packet | bytes] = None,
 	sequence_number: int = 0,
 	npdu_number: int = 0,
@@ -41,8 +48,6 @@ def build_gtpu_packet(
 	"""
 	if not 0 <= teid <= 0xFFFFFFFF:
 		raise ValueError("teid must be in the range 0..0xffffffff")
-	if pdu_type not in (0, 1):
-		raise ValueError("pdu_type must be 0 (DL) or 1 (UL)")
 	if not 0 <= sequence_number <= 0xFFFF:
 		raise ValueError("sequence_number must be in the range 0..0xffff")
 	if not 0 <= npdu_number <= 0xFF:
@@ -61,6 +66,19 @@ def build_gtpu_packet(
 			if not isinstance(value, int) or not 0 <= value <= maximum:
 				raise ValueError(f"{source_name} must be in the range 0..{maximum}")
 			normalized_fields[scapy_name] = value
+
+	has_rqi_or_ppi = (normalized_fields.get("RQI", 0) > 0 or normalized_fields.get("PPI", 0) > 0)
+
+	if pdu_type is None:
+		pdu_type = 0  # Default to DL (0) since RQI and PPI live in Downlink headers
+	elif pdu_type == 1 and has_rqi_or_ppi:
+		raise ValueError("RQI and PPI fields are downlink (DL) only and cannot be serialized with pdu_type=1 (UL)")
+
+	if pdu_type not in (0, 1):
+		raise ValueError("pdu_type must be 0 (DL) or 1 (UL)")
+
+	if normalized_fields.get("PPI", 0) > 0 and "PPP" not in normalized_fields:
+		normalized_fields["PPP"] = 1
 
 	container = GTPUPDUSessionContainer(type=pdu_type, **normalized_fields)
 	packet = GTP_U_Header(
@@ -115,6 +133,8 @@ def extract_container_kwargs(mutation_or_dict: Any) -> Dict[str, Any]:
 				for key in ("qfi", "rqi", "ppi"):
 					if hasattr(h, key) and key not in kwargs:
 						kwargs[key] = getattr(h, key)
+				if hasattr(h, "pdu_type") and "pdu_type" not in kwargs:
+					kwargs["pdu_type"] = getattr(h, "pdu_type")
 	else:
 		if hasattr(mutation_or_dict, "teid"):
 			kwargs["teid"] = getattr(mutation_or_dict, "teid")
