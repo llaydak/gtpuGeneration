@@ -23,6 +23,31 @@ from scapy.packet import Packet, Raw
 PDU_SESSION_CONTAINER_TYPE = 0x85
 GTPU_PORT = 2152
 
+SELF_HOSTED_MODELS_URL = "http://192.168.100.38:11434"
+MODEL_VARIANT = "mistral:7b"
+
+# Known GTP-U extension header types (3GPP TS 29.281 / 38.415 / 38.425 / 36.425).
+# Complete & exhaustive set of all 3GPP spec-defined extension header types.
+KNOWN_EXTENSION_TYPES = {
+    0x03: "udp_port",                  # UDP Port encapsulation
+    0x40: "pdcp_pdu_number",           # 16-bit PDCP Sequence Number (Handover/Dual Connectivity)
+    0x81: "suspend_request",           # Cellular IoT Suspend Request
+    0x82: "suspend_response",          # Cellular IoT Suspend Response
+    0x83: "long_pdcp_pdu_number",      # Long PDCP SN (NR/LTE Dual Connectivity)
+    0x84: "xw_ran_container",          # WLAN/LTE Interworking
+    0x85: "pdu_session_container",     # 5G Core QFI / RQI / PPI (N3/N9)
+    0xC0: "nr_ran_container",          # 5G RAN User Plane Control (Xn-U/F1-U)
+    0xC1: "pdu_set_marker",            # Rel-18 Extended Reality (XR)
+}
+
+ALLOWED_ANOMALIES = {
+    "qfi_qer_mismatch",                 # QFI not provisioned or QER rule mismatch
+    "unsupported_extension_injection",  # PDU Set Marker (0xC1) or other exotic header abuse
+    "cross_flow_interference",          # burst-based, individually-valid packets exploiting missing resource bounds
+    "timing_window_race",               # PFCP N4 policy update + GTP-U packet in propagation window (two-stage)
+}
+
+
 
 class GTPUPDUSessionContainer(GTPPDUSessionContainer):
 	"""Project-facing name for Scapy's PDU Session Container implementation."""

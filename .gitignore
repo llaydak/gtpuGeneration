@@ -1,0 +1,31 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+upfvenv/
+sysvenv/
+venv/
+.venv/
+env/
+
+# Captured PCAP trace files & logs
+*.pcap
+*.pcapng
+*.log
+
+# Environment variables & secrets
+.env
+.env.local
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
