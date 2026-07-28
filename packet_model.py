@@ -62,6 +62,6 @@ class GTP_U_Mutation:
             teid=mut_json.get("teid", ctx.teid),
             extension_headers=headers,
             outer_dscp=mut_json.get("outer_dscp", ctx.dscp_marking),
-            anomaly_type=mut_json.get("anomaly_type", "qfi_qer_mismatch"),
+            anomaly_type=mut_json.get("anomaly_type", mut_json.get("traffic_class", "qfi_qer_mismatch")),
             reasoning=mut_json.get("reasoning", ""),
         )

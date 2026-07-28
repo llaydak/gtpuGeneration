@@ -33,7 +33,7 @@ class SessionContext:
             qfi_to_qer={q: rng.randint(1, 32) for q in qfis},
             reflective_qos_enabled_qfis=rng.sample(qfis, k=max(1, len(qfis) // 2)),
             dscp_marking=rng.choice([0x00, 0x08, 0x28, 0x2E]),
-            pdu_type=rng.choice([0, 1]),
+            pdu_type=0,  # Locked to DL (0) for Phase 1 single-direction experimental scope
         )
 
     def to_prompt_block(self) -> str:

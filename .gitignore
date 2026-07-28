@@ -29,3 +29,6 @@ env/
 *.swo
 *~
 .DS_Store
+
+Semantics_to_GTP_U_Mapping.md
+llm_gtpu_attack_*.pcap

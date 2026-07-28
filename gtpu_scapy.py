@@ -14,7 +14,7 @@ and adds validation plus a small builder for the GTP-U header chain.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from scapy.contrib.gtp import GTPPDUSessionContainer, GTP_U_Header
 from scapy.packet import Packet, Raw
@@ -43,8 +43,17 @@ KNOWN_EXTENSION_TYPES = {
 ALLOWED_ANOMALIES = {
     "qfi_qer_mismatch",                 # QFI not provisioned or QER rule mismatch
     "unsupported_extension_injection",  # PDU Set Marker (0xC1) or other exotic header abuse
-    "cross_flow_interference",          # burst-based, individually-valid packets exploiting missing resource bounds
-    "timing_window_race",               # PFCP N4 policy update + GTP-U packet in propagation window (two-stage)
+    "cross_flow_interference",          # Burst-based cross-flow QFI divergence
+    "timing_window_race",               # Two-stage PFCP propagation race condition
+}
+
+# 3GPP Specification Field Boundaries (TS 29.281, TS 38.415, RFC 2474)
+FIELD_BOUNDS = {
+    "qfi": {"min": 0, "max": 63},
+    "rqi": {"min": 0, "max": 1},
+    "ppi": {"min": 0, "max": 7},
+    "pdu_type": {"min": 0, "max": 1},
+    "outer_dscp": {"min": 0, "max": 0x3F},
 }
 
 
@@ -206,6 +215,35 @@ def decode_gtpu_packet(data: bytes) -> GTP_U_Header:
 	return packet
 
 
+def export_campaign_to_pcap(
+	mutations: List[Any],
+	output_filename: str = "llm_gtpu_campaign.pcap",
+	outer_ip_src: str = "192.168.100.10",
+	outer_ip_dst: str = "192.168.100.20",
+	inner_payload: Optional[Packet | bytes] = None,
+) -> str:
+	"""Convert a sequence of mutation objects/dicts into a full wire-level PCAP trace."""
+	from scapy.layers.inet import IP, UDP, ICMP
+	from scapy.utils import wrpcap
+
+	if inner_payload is None:
+		inner_payload = IP(src="10.45.0.2", dst="8.8.8.8") / ICMP(type=8, code=0)
+
+	packets = []
+	for seq, mut in enumerate(mutations, start=1):
+		gtp_packet = build_gtpu_packet_from_mutation(mut, payload=inner_payload)
+		gtp_packet.seq = seq
+		wire_packet = (
+			IP(src=outer_ip_src, dst=outer_ip_dst)
+			/ UDP(sport=GTPU_PORT, dport=GTPU_PORT)
+			/ gtp_packet
+		)
+		packets.append(wire_packet)
+
+	wrpcap(output_filename, packets)
+	return output_filename
+
+
 __all__ = [
 	"GTPUPDUSessionContainer",
 	"GTP_U_Header",
@@ -214,5 +252,6 @@ __all__ = [
 	"build_gtpu_packet_from_mutation",
 	"extract_container_kwargs",
 	"decode_gtpu_packet",
+	"export_campaign_to_pcap",
 ]
 
