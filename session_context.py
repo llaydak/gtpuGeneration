@@ -29,7 +29,7 @@ class SessionContext:
         return cls(
             teid=teid,
             active_qfis=qfis,
-            qfi_to_5qi={q: rng.choice([1, 5, 7, 9, 69, 79]) for q in qfis},
+            qfi_to_5qi={q: rng.choice([1, 5, 6, 7, 9, 69, 79]) for q in qfis},
             qfi_to_qer={q: rng.randint(1, 32) for q in qfis},
             reflective_qos_enabled_qfis=rng.sample(qfis, k=max(1, len(qfis) // 2)),
             dscp_marking=rng.choice([0x00, 0x08, 0x28, 0x2E]),

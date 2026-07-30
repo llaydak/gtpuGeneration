@@ -1,5 +1,6 @@
 """Unit test suite for GTP-U generation, session context rules, and PCAP export."""
 
+# pyrefly: ignore [missing-import]
 import pytest
 from phase1_starter import (
     MistralClient,
@@ -151,12 +152,12 @@ def test_multi_anomaly_detection():
         reflective_qos_enabled_qfis=[2],
         dscp_marking=0x00,
     )
-    # Packet contains BOTH unsupported extension header (0xC1) AND invalid QFI (99)
-    headers = [{"type": 0xC1, "qfi": 99, "rqi": 0, "ppi": 0}]
+    # Packet contains BOTH timing window race request AND invalid QFI (99)
+    headers = [{"type": 0x85, "qfi": 99, "rqi": 0, "ppi": 0}]
     
-    res = client._infer_anomaly_type(headers, ctx, requested_type="unsupported_extension_injection")
+    res = client._infer_anomaly_type(headers, ctx, requested_type="timing_window_race")
     
-    assert res["primary_anomaly"] == "unsupported_extension_injection"
-    assert "unsupported_extension_injection" in res["detected_anomalies"]
+    assert res["primary_anomaly"] == "timing_window_race"
+    assert "timing_window_race" in res["detected_anomalies"]
     assert "qfi_qer_mismatch" in res["detected_anomalies"]
     assert res["is_compound_anomaly"] is True

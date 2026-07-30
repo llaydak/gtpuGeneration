@@ -10,7 +10,7 @@ from session_context import SessionContext
 
 @dataclass
 class ExtensionHeader:
-    ext_type: int      # e.g. 0x85 PDU Session Container, 0xC1 PDU Set Marker
+    ext_type: int      # e.g. 0x85 PDU Session Container
     qfi: int = 0
     rqi: int = 0
     ppi: int = 0
@@ -33,6 +33,8 @@ class GTP_U_Mutation:
     npdu_flag: int = 0
     sequence_number: int = 0
     npdu_number: int = 0
+    payload_size: Optional[int] = None
+    inter_arrival_ms: Optional[float] = None
     timestamp: Optional[float] = None
 
     def __post_init__(self):
@@ -64,4 +66,7 @@ class GTP_U_Mutation:
             outer_dscp=mut_json.get("outer_dscp", ctx.dscp_marking),
             anomaly_type=mut_json.get("anomaly_type", mut_json.get("traffic_class", "qfi_qer_mismatch")),
             reasoning=mut_json.get("reasoning", ""),
+            payload_size=mut_json.get("payload_size"),
+            inter_arrival_ms=mut_json.get("inter_arrival_ms"),
         )
+

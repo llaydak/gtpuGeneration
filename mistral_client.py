@@ -1,6 +1,7 @@
 """Mistral LLM offline client for GTP-U benign baseline & adversarial mutation generation."""
 
 import json
+import random
 import re
 from typing import Optional, Dict, List, Any
 
@@ -27,21 +28,6 @@ class MistralClient:
         self.base_url = base_url
         self.model_name = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
 
-    def health_check(self) -> bool:
-        if litellm_completion is not None:
-            try:
-                response = litellm_completion(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": "hi"}],
-                    api_base=self.base_url,
-                    temperature=0.7,
-                    max_tokens=5,
-                )
-                return bool(getattr(response, "choices", None))
-            except Exception as e:
-                print(f"[WARN] litellm health check failed: {e}")
-        return False
-
     def generate(self, prompt: str, system: str, temperature: float = 0.7,
                  max_tokens: int = 2000) -> str:
         if litellm_completion is not None:
@@ -67,23 +53,13 @@ class MistralClient:
                             previous_mutations: Optional[List[Dict]] = None,
                             outer_dscp: Optional[int] = None) -> Dict[str, Any]:
         """Resolve primary anomaly type and all detected secondary anomaly types from packet fields.
-
-        Returns a dictionary with:
-        - primary_anomaly (str): The main resolved anomaly type (aligned with requested_type if matched)
-        - detected_anomalies (List[str]): All anomaly types satisfied by the packet fields
-        - is_compound_anomaly (bool): True if more than one anomaly type was detected
         """
-        ext_types = [h.get("type", 0x85) for h in headers]
         qfis = [h.get("qfi", 0) for h in headers]
         rqis = [h.get("rqi", 0) for h in headers]
 
         detected = []
 
-        # Check 1: Unsupported Extension Header Injection
-        if any(t != 0x85 for t in ext_types):
-            detected.append("unsupported_extension_injection")
-
-        # Check 2: Cross-Flow Interference (Campaign Context: QFIs diverge across burst packets)
+        # Check 1: Cross-Flow Interference (Campaign Context: QFIs diverge across burst packets)
         if previous_mutations:
             prev_qfis = []
             for prev in previous_mutations[-2:]:
@@ -91,11 +67,11 @@ class MistralClient:
             if prev_qfis and set(qfis) != set(prev_qfis):
                 detected.append("cross_flow_interference")
 
-        # Check 3: Two-Stage Timing Window Race Condition
+        # Check 2: Two-Stage Timing Window Race Condition
         if requested_type == "timing_window_race":
             detected.append("timing_window_race")
 
-        # Check 4: QFI / QER / DSCP Semantic Policy Mismatch
+        # Check 3: QFI / QER / DSCP Semantic Policy Mismatch
         unprovisioned_qfi = any(q not in ctx.active_qfis for q in qfis)
         invalid_rqi = any(rqi == 1 and q not in ctx.reflective_qos_enabled_qfis for q, rqi in zip(qfis, rqis))
         invalid_dscp = (outer_dscp is not None and outer_dscp != ctx.dscp_marking)
@@ -156,8 +132,6 @@ class MistralClient:
         rqi = first.get("rqi", 0)
         dscp = mutation.get("outer_dscp", ctx.dscp_marking)
 
-        if any(h.get("type") == 0xC1 for h in headers):
-            return "Injected an unsupported PDU Set Marker header into a session context that has no matching policy basis."
         if qfi not in ctx.active_qfis:
             return f"QFI {qfi} is not provisioned for this session's active QFI set {ctx.active_qfis}."
         if rqi and qfi not in ctx.reflective_qos_enabled_qfis:
@@ -170,25 +144,25 @@ class MistralClient:
         """Deterministically check if the generated packet violates session policy bounds."""
         first_qfi = headers[0].get("qfi", 0) if headers else 0
         first_rqi = headers[0].get("rqi", 0) if headers else 0
-        has_unsupported = any(h.get("type") == 0xC1 for h in headers)
-
         violates_qfis = first_qfi not in ctx.active_qfis
-        violates_rqi = (first_rqi == 1 and first_qfi not in ctx.reflective_qos_enabled_qfis)
-        violates_dscp = (dscp != ctx.dscp_marking)
-
-        is_anomalous = violates_qfis or violates_rqi or violates_dscp or has_unsupported
+        violates_rqi = (first_rqi == 1) and (first_qfi not in ctx.reflective_qos_enabled_qfis)
+        violates_dscp = dscp != ctx.dscp_marking
+        is_anomalous = violates_qfis or violates_rqi or violates_dscp
 
         return {
             "violates_active_qfis": violates_qfis,
             "violates_rqi_allowlist": violates_rqi,
             "violates_dscp_marking": violates_dscp,
-            "contains_unsupported_header": has_unsupported,
             "is_semantically_anomalous": is_anomalous,
             "semantic_precision_score": 1.0 if is_anomalous else 0.0,
         }
 
     def _evaluate_structured_claims(self, claims: Optional[Dict], headers: List[Dict], ctx: SessionContext) -> Dict[str, Any]:
-        """Compare optional structured JSON claims from model against packet fields deterministically."""
+        """Evaluation metric only: compare optional structured JSON claims from model against packet fields.
+
+        This check is logged in the mutation dict for research evaluation purposes.
+        It does not modify or gate any packet; it is never called in the benign path.
+        """
         if not isinstance(claims, dict):
             return {"has_structured_claims": False, "claims_alignment_score": 1.0}
 
@@ -299,6 +273,16 @@ class MistralClient:
         eval_res = self._infer_anomaly_type(sanitized_headers, ctx, requested_type, previous_mutations, outer_dscp=dscp)
         resolved_type = eval_res["primary_anomaly"]
 
+        try:
+            payload_size = int(raw.get("payload_size", 100))
+        except (TypeError, ValueError):
+            payload_size = 100
+
+        try:
+            inter_arrival_ms = float(raw.get("inter_arrival_ms", 20.0))
+        except (TypeError, ValueError):
+            inter_arrival_ms = 20.0
+
         # Record raw LLM intent alignment metric BEFORE any clamping repair occurred
         no_clamping_needed = (len(sanitization_log["clamped_fields"]) == 0 and sanitization_log["raw_schema_valid"])
         intent_matches_resolved = (requested_type in eval_res["detected_anomalies"])
@@ -317,6 +301,8 @@ class MistralClient:
             "raw_llm_intent_aligned": raw_llm_intent_aligned,
             "sanitization_log": sanitization_log,
             "reasoning": reasoning,
+            "payload_size": payload_size,
+            "inter_arrival_ms": inter_arrival_ms,
         }
         mutation_dict = self._ensure_diverse_structure(mutation_dict, ctx, previous_mutations)
         mutation_dict["reasoning"] = self._build_reasoning(mutation_dict, ctx)
@@ -364,6 +350,10 @@ NOTE: RQI and PPI are only meaningful when pdu_type=0 (downlink). If you set rqi
 CAMPAIGN DIVERSITY REQUIREMENT:
 If previous packets are shown above, your new packet MUST explore a different header order, QFI, or flag state.
 
+Traffic Modeling:
+Based on the chosen QFI's 5QI from {ctx.qfi_to_5qi}, you MUST estimate and output realistic `payload_size` (int, bytes) and `inter_arrival_ms` (float, milliseconds) in your JSON output.
+Do not use generic values; apply your knowledge of 3GPP TS 23.501 traffic characteristics for the specific 5QI.
+
 Field bounds:
 - pdu_type: {FIELD_BOUNDS['pdu_type']['min']} (DL / Downlink) or {FIELD_BOUNDS['pdu_type']['max']} (UL / Uplink)
 - qfi: {FIELD_BOUNDS['qfi']['min']}-{FIELD_BOUNDS['qfi']['max']}, rqi: {FIELD_BOUNDS['rqi']['min']}-{FIELD_BOUNDS['rqi']['max']}, ppi: {FIELD_BOUNDS['ppi']['min']}-{FIELD_BOUNDS['ppi']['max']}, outer_dscp: {FIELD_BOUNDS['outer_dscp']['min']}-{FIELD_BOUNDS['outer_dscp']['max']}
@@ -376,7 +366,9 @@ RESPOND ONLY WITH VALID JSON (no markdown formatting):
   "outer_dscp": <int {FIELD_BOUNDS['outer_dscp']['min']}-{FIELD_BOUNDS['outer_dscp']['max']}>,
   "anomaly_type": "<one of: {sorted(ALLOWED_ANOMALIES)}>",
   "claims": {{"target_qfi": <int>}},
-  "reasoning": "<1 concise sentence explaining the policy violation>"
+  "reasoning": "<1 concise sentence explaining the policy violation>",
+  "payload_size": <int>,
+  "inter_arrival_ms": <float>
 }}
 
 CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex notation like 0x00 or 0x85.
@@ -434,7 +426,7 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             dscp = max(FIELD_BOUNDS["outer_dscp"]["min"], min(FIELD_BOUNDS["outer_dscp"]["max"], dscp))
 
         # Check raw LLM compliance BEFORE any clamping/repair occurred
-        raw_first_header = ext_headers_raw[0] if isinstance(ext_headers_raw[0], dict) else {}
+        raw_first_header = ext_headers_raw[0] if (isinstance(ext_headers_raw, list) and ext_headers_raw and isinstance(ext_headers_raw[0], dict)) else {}
         raw_qfi = raw_first_header.get("qfi")
         raw_rqi = raw_first_header.get("rqi", 0)
         raw_dscp_val = raw.get("outer_dscp")
@@ -455,6 +447,16 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 
         reasoning = str(raw.get("reasoning", "")) or "Normal traffic consistent with session QoS policy."
 
+        try:
+            payload_size = int(raw.get("payload_size", 100))
+        except (TypeError, ValueError):
+            payload_size = 100
+
+        try:
+            inter_arrival_ms = float(raw.get("inter_arrival_ms", 20.0))
+        except (TypeError, ValueError):
+            inter_arrival_ms = 20.0
+
         return {
             "teid": ctx.teid,
             "extension_headers": sanitized_headers,
@@ -472,6 +474,8 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             "raw_schema_valid": sanitization_log["raw_schema_valid"],
             "sanitization_log": sanitization_log,
             "reasoning": reasoning,
+            "payload_size": payload_size,
+            "inter_arrival_ms": inter_arrival_ms,
         }
 
     def generate_benign(self, ctx: SessionContext, max_retries: int = 3) -> Optional[Dict]:
@@ -484,7 +488,7 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             "Do NOT introduce any anomaly or policy violation."
         )
 
-        sample_qfi = ctx.active_qfis[0]
+        sample_qfi = random.choice(ctx.active_qfis)
         sample_rqi = 1 if sample_qfi in ctx.reflective_qos_enabled_qfis else 0
 
         prompt = f"""Session state (your packet MUST be consistent with this):
@@ -504,6 +508,10 @@ STRICT RULES:
 5. ppi MUST be 0 (non-paging baseline traffic).
 6. outer_dscp MUST be {ctx.dscp_marking}.
 
+Traffic Modeling:
+Based on the chosen QFI's 5QI from {ctx.qfi_to_5qi}, you MUST output realistic sizes and timing using your own knowledge of 3GPP TS 23.501.
+You MUST include `payload_size` (int, bytes) and `inter_arrival_ms` (float, milliseconds) in your JSON output.
+
 EXAMPLE VALID OUTPUT:
 {{
   "extension_headers": [
@@ -512,7 +520,9 @@ EXAMPLE VALID OUTPUT:
   "outer_dscp": {ctx.dscp_marking},
   "traffic_class": "benign",
   "anomaly_type": "benign",
-  "reasoning": "Packet uses provisioned active QFI {sample_qfi} with expected outer DSCP {ctx.dscp_marking}."
+  "reasoning": "Packet uses provisioned active QFI {sample_qfi} with expected outer DSCP {ctx.dscp_marking}.",
+  "payload_size": 100,
+  "inter_arrival_ms": 20.0
 }}
 
 Field bounds:
@@ -529,7 +539,10 @@ RESPOND ONLY WITH VALID JSON (no markdown formatting, no string placeholders):
             response = self.generate(prompt, system, temperature=0.3, max_tokens=500)
             parsed = self._parse_json_response(response)
             if parsed:
-                return self._sanitize_benign(parsed, ctx)
+                try:
+                    return self._sanitize_benign(parsed, ctx)
+                except Exception as e:
+                    print(f"[WARN] Exception during _sanitize_benign on attempt {attempt}: {e}")
             print(f"[WARN] Failed to generate/parse benign JSON from Mistral on attempt {attempt}/{max_retries}")
 
         print(f"[ERROR] Failed to generate benign packet after {max_retries} attempts.")

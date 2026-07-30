@@ -20,25 +20,6 @@ from packet_model import ExtensionHeader, GTP_U_Mutation
 from mistral_client import MistralClient
 from upf_monitor import UPF_Telemetry, UPF_Monitor
 
-__all__ = [
-    "SELF_HOSTED_MODELS_URL",
-    "MODEL_VARIANT",
-    "KNOWN_EXTENSION_TYPES",
-    "ALLOWED_ANOMALIES",
-    "SessionContext",
-    "ExtensionHeader",
-    "GTP_U_Mutation",
-    "MistralClient",
-    "UPF_Telemetry",
-    "UPF_Monitor",
-    "build_gtpu_packet",
-    "build_gtpu_packet_from_mutation",
-    "GTP_U_Header",
-    "GTPUPDUSessionContainer",
-    "export_campaign_to_pcap",
-]
-
-
 def main(save_pcap: bool = True):
     print("=" * 70)
     print("session-aware mutation + chained extension headers")
