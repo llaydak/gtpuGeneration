@@ -20,6 +20,25 @@ try:
 except Exception:
     litellm_completion = None
 
+# 3GPP TS 23.501 Table 5.7.4-1 Resource Type + Example Services, for the 5QIs
+# this project uses. Grounding this directly rather than trusting model
+# recall: testing showed models (phi4:14b, mistral:7b) reliably misidentify
+# 5QI 6 as a GBR conversational voice/video service, when it's actually
+# Non-GBR/TCP-based (web browsing, email, chat, ftp) — the wrong application
+# category then drives a wrong-but-internally-consistent bitrate estimate
+# downstream. This is real public standard data, not this project's own
+# assumed traffic numbers, so it doesn't hand the model the answer.
+_5QI_3GPP_REFERENCE = {
+    1: "GBR, Conversational Voice",
+    2: "GBR, Conversational Video (Live Streaming)",
+    3: "GBR, Real-Time Gaming, V2X messages",
+    4: "GBR, Non-Conversational Video (Buffered Streaming)",
+    6: "Non-GBR, TCP-based apps (www, email, chat, ftp, p2p file sharing) — i.e. web browsing, NOT voice/video",
+    7: "Non-GBR, Voice/Video (Live Streaming), interactive gaming",
+    8: "Non-GBR, video (buffered streaming), TCP-based apps",
+    9: "Non-GBR, video (buffered streaming), TCP-based apps (default bearer)",
+}
+
 
 class MistralClient:
     """Wrapper for offline LLM usage via local Ollama and LiteLLM."""
@@ -447,15 +466,42 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 
         reasoning = str(raw.get("reasoning", "")) or "Normal traffic consistent with session QoS policy."
 
+        # No fallback here on purpose: a non-numeric or missing value means the
+        # LLM failed to reason about this 5QI's traffic profile, and silently
+        # substituting a generic default would mask that failure as if it were
+        # a real (if uninspired) answer. Raise so generate_benign retries the
+        # call instead, and count exhausted retries as a genuine failed slot.
+        #
+        # The LLM supplies target_bitrate_bps (semantic: "what does this 5QI's
+        # application actually run at") and inter_arrival_ms (its packetization
+        # period) — payload_size is then DERIVED here deterministically rather
+        # than asked of the model directly. Testing showed models (mistral:7b,
+        # phi4:14b, deepseek-r1:14b) consistently fail the bitrate*iat/8
+        # arithmetic themselves, converging on a generic ~100-150B "typical
+        # packet" prior regardless of the bitrate they just stated — moving
+        # the arithmetic out of the LLM's hands removes that failure mode
+        # entirely, consistent with this project's semantic-reasoning/
+        # deterministic-construction split (see methodology.pdf Sec. 1).
         try:
-            payload_size = int(raw.get("payload_size", 100))
-        except (TypeError, ValueError):
-            payload_size = 100
+            target_bitrate_bps = float(raw["target_bitrate_bps"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"LLM returned non-numeric or missing target_bitrate_bps: {raw.get('target_bitrate_bps')!r}") from e
+        if target_bitrate_bps <= 0:
+            raise ValueError(f"LLM returned non-positive target_bitrate_bps: {target_bitrate_bps}")
 
         try:
-            inter_arrival_ms = float(raw.get("inter_arrival_ms", 20.0))
-        except (TypeError, ValueError):
-            inter_arrival_ms = 20.0
+            inter_arrival_ms = float(raw["inter_arrival_ms"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"LLM returned non-numeric or missing inter_arrival_ms: {raw.get('inter_arrival_ms')!r}") from e
+        if inter_arrival_ms <= 0:
+            raise ValueError(f"LLM returned non-positive inter_arrival_ms: {inter_arrival_ms}")
+
+        payload_size = round(target_bitrate_bps * (inter_arrival_ms / 1000.0) / 8.0)
+        if not (1 <= payload_size <= 65000):
+            raise ValueError(
+                f"Derived payload_size out of valid range: {payload_size} "
+                f"(from target_bitrate_bps={target_bitrate_bps}, inter_arrival_ms={inter_arrival_ms})"
+            )
 
         return {
             "teid": ctx.teid,
@@ -476,6 +522,7 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             "reasoning": reasoning,
             "payload_size": payload_size,
             "inter_arrival_ms": inter_arrival_ms,
+            "target_bitrate_bps": target_bitrate_bps,
         }
 
     def generate_benign(self, ctx: SessionContext, max_retries: int = 3) -> Optional[Dict]:
@@ -490,6 +537,12 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 
         sample_qfi = random.choice(ctx.active_qfis)
         sample_rqi = 1 if sample_qfi in ctx.reflective_qos_enabled_qfis else 0
+        sample_5qi = ctx.qfi_to_5qi.get(sample_qfi)
+
+        qfi_5qi_reference = "\n".join(
+            f"  5QI {five_qi}: {_5QI_3GPP_REFERENCE.get(five_qi, 'unlisted — use your own TS 23.501 knowledge')}"
+            for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
+        )
 
         prompt = f"""Session state (your packet MUST be consistent with this):
 - TEID: {ctx.teid}
@@ -500,6 +553,10 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 - QFIs where Reflective QoS (RQI=1) is allowed: {ctx.reflective_qos_enabled_qfis}
 - Session expected outer DSCP marking: {ctx.dscp_marking}
 
+3GPP TS 23.501 Table 5.7.4-1 reference (Resource Type, Example Services) for
+the 5QIs in this session — use this, not a guess, to identify the application:
+{qfi_5qi_reference}
+
 STRICT RULES:
 1. extension_headers must contain exactly ONE entry with type 133 (PDU Session Container).
 2. qfi MUST be an integer chosen from the session's active QFIs: {ctx.active_qfis}
@@ -509,10 +566,17 @@ STRICT RULES:
 6. outer_dscp MUST be {ctx.dscp_marking}.
 
 Traffic Modeling:
-Based on the chosen QFI's 5QI from {ctx.qfi_to_5qi}, you MUST output realistic sizes and timing using your own knowledge of 3GPP TS 23.501.
-You MUST include `payload_size` (int, bytes) and `inter_arrival_ms` (float, milliseconds) in your JSON output.
+Look up this QFI's 5QI in {ctx.qfi_to_5qi} and recall its TS 23.501 Table 5.7.4-1
+application (e.g. voice, video, gaming, browsing). Output two values about
+that application: `target_bitrate_bps` (its real sustained bitrate, bits/sec)
+and `inter_arrival_ms` (its typical packetization period). Do NOT compute a
+packet size yourself — the system derives it deterministically from these two
+numbers, so just report the application's real-world bitrate and timing
+faithfully. Values must vary by 5QI; never reuse the same numbers across
+sessions.
 
-EXAMPLE VALID OUTPUT:
+EXAMPLE VALID OUTPUT (structure only — replace target_bitrate_bps and
+inter_arrival_ms with values reasoned for 5QI {sample_5qi} as above, not these):
 {{
   "extension_headers": [
     {{"type": 133, "pdu_type": 0, "qfi": {sample_qfi}, "rqi": {sample_rqi}, "ppi": 0}}
@@ -520,9 +584,9 @@ EXAMPLE VALID OUTPUT:
   "outer_dscp": {ctx.dscp_marking},
   "traffic_class": "benign",
   "anomaly_type": "benign",
-  "reasoning": "Packet uses provisioned active QFI {sample_qfi} with expected outer DSCP {ctx.dscp_marking}.",
-  "payload_size": 100,
-  "inter_arrival_ms": 20.0
+  "reasoning": "<one sentence: which 5QI/service you assumed and why these values fit it>",
+  "target_bitrate_bps": "<int, bits/sec, this 5QI's real sustained bitrate>",
+  "inter_arrival_ms": "<float, ms, this 5QI's real packetization period>"
 }}
 
 Field bounds:
@@ -533,7 +597,12 @@ Field bounds:
 - ppi: 0
 - outer_dscp: {ctx.dscp_marking}
 
-RESPOND ONLY WITH VALID JSON (no markdown formatting, no string placeholders):
+Use these EXACT field names, spelled correctly: extension_headers, outer_dscp,
+target_bitrate_bps, inter_arrival_ms.
+
+RESPOND ONLY WITH VALID JSON (no markdown formatting, no string placeholders —
+target_bitrate_bps and inter_arrival_ms must be actual numbers in your
+response, not the placeholder text shown above):
 """
         for attempt in range(1, max_retries + 1):
             response = self.generate(prompt, system, temperature=0.3, max_tokens=500)
