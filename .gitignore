@@ -12,7 +12,7 @@ sysvenv/
 venv/
 .venv/
 env/
-
+pcap_files/
 # Captured PCAP trace files & logs
 *.pcap
 *.pcapng
@@ -32,3 +32,4 @@ env/
 
 Semantics_to_GTP_U_Mapping.md
 llm_gtpu_attack_*.pcap
+

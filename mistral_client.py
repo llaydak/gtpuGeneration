@@ -1,6 +1,7 @@
 """Mistral LLM offline client for GTP-U benign baseline & adversarial mutation generation."""
 
 import json
+import os
 import random
 import re
 from typing import Optional, Dict, List, Any
@@ -20,48 +21,77 @@ try:
 except Exception:
     litellm_completion = None
 
-# 3GPP TS 23.501 Table 5.7.4-1 Resource Type + Example Services, for the 5QIs
-# this project uses. Grounding this directly rather than trusting model
-# recall: testing showed models (phi4:14b, mistral:7b) reliably misidentify
-# 5QI 6 as a GBR conversational voice/video service, when it's actually
-# Non-GBR/TCP-based (web browsing, email, chat, ftp) — the wrong application
-# category then drives a wrong-but-internally-consistent bitrate estimate
-# downstream. This is real public standard data, not this project's own
-# assumed traffic numbers, so it doesn't hand the model the answer.
 _5QI_3GPP_REFERENCE = {
-    1: "GBR, Conversational Voice",
     2: "GBR, Conversational Video (Live Streaming)",
     3: "GBR, Real-Time Gaming, V2X messages",
     4: "GBR, Non-Conversational Video (Buffered Streaming)",
     6: "Non-GBR, TCP-based apps (www, email, chat, ftp, p2p file sharing) — i.e. web browsing, NOT voice/video",
-    7: "Non-GBR, Voice/Video (Live Streaming), interactive gaming",
     8: "Non-GBR, video (buffered streaming), TCP-based apps",
-    9: "Non-GBR, video (buffered streaming), TCP-based apps (default bearer)",
 }
 
 
 class MistralClient:
-    """Wrapper for offline LLM usage via local Ollama and LiteLLM."""
+    """Wrapper for LLM usage via LiteLLM, backed by either a local Ollama
+    server (default, offline) or the OpenAI API (backend="openai")."""
 
-    def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT):
-        self.base_url = base_url
-        self.model_name = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
+    def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT,
+                 backend: str = "ollama", api_key: Optional[str] = None,
+                 max_output_tokens: Optional[int] = None):
+        self.backend = backend
+        # Ceiling applied to every generate() call's max_tokens, regardless of
+        # backend; None (default) leaves each call site's own value untouched.
+        self.max_output_tokens = max_output_tokens
+        self.call_count = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
 
-    def generate(self, prompt: str, system: str, temperature: float = 0.7,
-                 max_tokens: int = 2000) -> str:
+        if backend == "openai":
+            self.base_url = None  # api_base is for the self-hosted Ollama server only
+            self.model_name = model_name if model_name.startswith("openai/") else f"openai/{model_name}"
+            self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+            if not self.api_key:
+                raise ValueError(
+                    "backend='openai' requires an API key: set OPENAI_API_KEY or pass api_key="
+                )
+        elif backend == "ollama":
+            self.base_url = base_url
+            self.model_name = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
+            self.api_key = None
+        else:
+            raise ValueError(f"Unknown backend {backend!r}, expected 'ollama' or 'openai'")
+
+    def generate(self, prompt: str, system: str, max_tokens: int = 2000) -> str:
+        if self.max_output_tokens is not None:
+            max_tokens = min(max_tokens, self.max_output_tokens)
         if litellm_completion is not None:
             try:
-                response = litellm_completion(
+                kwargs = dict(
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt},
                     ],
-                    api_base=self.base_url,
-                    temperature=temperature,
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                 )
+                if self.base_url is not None:
+                    kwargs["api_base"] = self.base_url
+                if self.api_key is not None:
+                    kwargs["api_key"] = self.api_key
+                response = litellm_completion(**kwargs)
+
+                self.call_count += 1
+                usage = getattr(response, "usage", None)
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+                print(
+                    f"[API CALL #{self.call_count}] model={self.model_name} "
+                    f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+                    f"(running total: {self.total_prompt_tokens} prompt / {self.total_completion_tokens} completion)"
+                )
+
                 return response.choices[0].message.content.strip()
             except Exception as e:
                 print(f"[WARN] litellm generation failed: {e}")
@@ -288,7 +318,6 @@ class MistralClient:
             sanitization_log["raw_schema_valid"] = False
             dscp = max(FIELD_BOUNDS["outer_dscp"]["min"], min(FIELD_BOUNDS["outer_dscp"]["max"], dscp))
 
-        reasoning = str(raw.get("reasoning", "")) or "Semantic anomaly within schema bounds."
         eval_res = self._infer_anomaly_type(sanitized_headers, ctx, requested_type, previous_mutations, outer_dscp=dscp)
         resolved_type = eval_res["primary_anomaly"]
 
@@ -319,13 +348,12 @@ class MistralClient:
             "raw_schema_valid": sanitization_log["raw_schema_valid"],
             "raw_llm_intent_aligned": raw_llm_intent_aligned,
             "sanitization_log": sanitization_log,
-            "reasoning": reasoning,
             "payload_size": payload_size,
             "inter_arrival_ms": inter_arrival_ms,
         }
         mutation_dict = self._ensure_diverse_structure(mutation_dict, ctx, previous_mutations)
         mutation_dict["reasoning"] = self._build_reasoning(mutation_dict, ctx)
-        
+
         mutation_dict["semantic_precision"] = self._evaluate_semantic_precision(
             mutation_dict["extension_headers"], dscp, ctx
         )
@@ -393,7 +421,7 @@ RESPOND ONLY WITH VALID JSON (no markdown formatting):
 CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex notation like 0x00 or 0x85.
 """
         for attempt in range(1, max_retries + 1):
-            response = self.generate(prompt, system, temperature=0.8, max_tokens=2000)
+            response = self.generate(prompt, system, max_tokens=2000)
             parsed = self._parse_json_response(response)
             if parsed:
                 return self._sanitize_mutation(parsed, ctx, previous_mutations=previous_mutations)
@@ -421,11 +449,9 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             print(f"[TELEMETRY] Burst campaign completed with reduced size: {len(burst)}/{burst_size} packets generated.")
         return burst
 
-    # ------------------------------------------------------------------
-    # Benign (baseline) traffic generation
-    # ------------------------------------------------------------------
-
-    def _sanitize_benign(self, raw: Any, ctx: SessionContext) -> Optional[Dict[str, Any]]:
+    def _sanitize_benign(self, raw: Any, ctx: SessionContext,
+                         reference_bitrate_bps: Optional[float] = None,
+                         reference_inter_arrival_ms: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Sanitize LLM output for benign traffic, recording raw LLM compliance
         to track model adherence metrics without hiding failures behind clamping."""
         if not isinstance(raw, dict):
@@ -466,22 +492,6 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 
         reasoning = str(raw.get("reasoning", "")) or "Normal traffic consistent with session QoS policy."
 
-        # No fallback here on purpose: a non-numeric or missing value means the
-        # LLM failed to reason about this 5QI's traffic profile, and silently
-        # substituting a generic default would mask that failure as if it were
-        # a real (if uninspired) answer. Raise so generate_benign retries the
-        # call instead, and count exhausted retries as a genuine failed slot.
-        #
-        # The LLM supplies target_bitrate_bps (semantic: "what does this 5QI's
-        # application actually run at") and inter_arrival_ms (its packetization
-        # period) — payload_size is then DERIVED here deterministically rather
-        # than asked of the model directly. Testing showed models (mistral:7b,
-        # phi4:14b, deepseek-r1:14b) consistently fail the bitrate*iat/8
-        # arithmetic themselves, converging on a generic ~100-150B "typical
-        # packet" prior regardless of the bitrate they just stated — moving
-        # the arithmetic out of the LLM's hands removes that failure mode
-        # entirely, consistent with this project's semantic-reasoning/
-        # deterministic-construction split (see methodology.pdf Sec. 1).
         try:
             target_bitrate_bps = float(raw["target_bitrate_bps"])
         except (KeyError, TypeError, ValueError) as e:
@@ -496,11 +506,25 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
         if inter_arrival_ms <= 0:
             raise ValueError(f"LLM returned non-positive inter_arrival_ms: {inter_arrival_ms}")
 
+        # This is a burst's TOTAL byte count (the caller splits it into
+        # MTU-sized wire segments), not one packet's size. Bound it relative
+        # to the session's own reference traffic profile rather than a fixed
+        # number, so the check scales with whatever 5QI is actually in play.
+        # The prompt allows bitrate and inter_arrival_ms to each independently
+        # go up to ~3-4x their reference (real outliers on each axis) — since
+        # payload_size = bitrate * iat, two simultaneous outliers compound
+        # multiplicatively, so the ceiling needs headroom for ~12x, not 5x.
         payload_size = round(target_bitrate_bps * (inter_arrival_ms / 1000.0) / 8.0)
-        if not (1 <= payload_size <= 65000):
+        if reference_bitrate_bps and reference_inter_arrival_ms:
+            reference_payload_size = reference_bitrate_bps * (reference_inter_arrival_ms / 1000.0) / 8.0
+            max_payload_size = max(1000, round(reference_payload_size * 15))
+        else:
+            max_payload_size = 1_000_000
+        if not (1 <= payload_size <= max_payload_size):
             raise ValueError(
                 f"Derived payload_size out of valid range: {payload_size} "
-                f"(from target_bitrate_bps={target_bitrate_bps}, inter_arrival_ms={inter_arrival_ms})"
+                f"(from target_bitrate_bps={target_bitrate_bps}, inter_arrival_ms={inter_arrival_ms}, "
+                f"max allowed={max_payload_size})"
             )
 
         return {
@@ -525,8 +549,19 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             "target_bitrate_bps": target_bitrate_bps,
         }
 
-    def generate_benign(self, ctx: SessionContext, max_retries: int = 3) -> Optional[Dict]:
-        """Generate a single benign, session-consistent GTP-U packet via LLM."""
+    def generate_benign_batch(self, ctx: SessionContext, batch_size: int = 50,
+                               max_retries: int = 3,
+                               reference_bitrate_bps: Optional[float] = None,
+                               reference_inter_arrival_ms: Optional[float] = None) -> List[Dict]:
+        """Generate up to `batch_size` benign baseline packets in a SINGLE LLM
+        call. Each call's output is capped by self.max_output_tokens (or a
+        batch_size-based guess if unset), so pick batch_size accordingly
+        (roughly 150-250 tokens per packet).
+
+        reference_bitrate_bps / reference_inter_arrival_ms, if given, anchor
+        the model's per-packet estimates to a known real-world value (e.g.
+        Table II of the reference paper) instead of its own unguided recall.
+        """
 
         system = (
             "You are a 5G core network engineer. Your task is to produce "
@@ -544,7 +579,24 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
         )
 
-        prompt = f"""Session state (your packet MUST be consistent with this):
+        reference_block = ""
+        if reference_bitrate_bps is not None and reference_inter_arrival_ms is not None:
+            reference_block = f"""
+Reference measurement for this 5QI (Table II, published traffic model — anchor
+to this, don't invent your own order of magnitude): mean sustained bitrate ~=
+{reference_bitrate_bps:.0f} bps, mean inter-arrival ~= {reference_inter_arrival_ms:.1f} ms.
+Real traffic at these means is NOT uniform around them — match these shapes,
+don't clip to a narrow band:
+- inter_arrival_ms behaves like a memoryless (exponential) process: most gaps
+  cluster near or below the mean, but roughly 1 in 6-8 packets should have a
+  gap 2-4x the mean — genuine outliers, not softened.
+- target_bitrate_bps (and thus burst size) is right-skewed (log-normal,
+  coefficient of variation ~0.3): most values within about +/-30% of the
+  mean, but roughly 1 in 8-10 packets should be noticeably larger, up to 2-3x
+  the mean — real bursts do get that big.
+"""
+
+        prompt = f"""Session state (every packet you produce MUST be consistent with this):
 - TEID: {ctx.teid}
 - Session Direction: DL (Downlink) (pdu_type=0)
 - Active QFIs for this session: {ctx.active_qfis}
@@ -557,7 +609,7 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 the 5QIs in this session — use this, not a guess, to identify the application:
 {qfi_5qi_reference}
 
-STRICT RULES:
+STRICT RULES (apply to EVERY packet in the array):
 1. extension_headers must contain exactly ONE entry with type 133 (PDU Session Container).
 2. qfi MUST be an integer chosen from the session's active QFIs: {ctx.active_qfis}
 3. pdu_type MUST be 0 (Downlink).
@@ -567,26 +619,36 @@ STRICT RULES:
 
 Traffic Modeling:
 Look up this QFI's 5QI in {ctx.qfi_to_5qi} and recall its TS 23.501 Table 5.7.4-1
-application (e.g. voice, video, gaming, browsing). Output two values about
-that application: `target_bitrate_bps` (its real sustained bitrate, bits/sec)
-and `inter_arrival_ms` (its typical packetization period). Do NOT compute a
-packet size yourself — the system derives it deterministically from these two
-numbers, so just report the application's real-world bitrate and timing
-faithfully. Values must vary by 5QI; never reuse the same numbers across
-sessions.
+application (e.g. voice, video, gaming, browsing). For EACH packet output
+`target_bitrate_bps` (bits/sec) and `inter_arrival_ms` (ms) for that
+application. Do NOT compute payload size yourself — it is derived
+deterministically downstream from these two numbers.
+{reference_block}
 
-EXAMPLE VALID OUTPUT (structure only — replace target_bitrate_bps and
-inter_arrival_ms with values reasoned for 5QI {sample_5qi} as above, not these):
+REALISM REQUIREMENT: real traffic has genuine variance, not mild jitter — do
+NOT repeat the exact same target_bitrate_bps/inter_arrival_ms pair on every
+packet, and do NOT make every packet a small tweak of the last. A handful of
+real outliers (noticeably larger or with a longer gap) is what makes a
+distribution look real instead of artificial; a distribution with no outliers
+at all is itself unrealistic.
+
+Generate EXACTLY {batch_size} such packets.
+
+EXAMPLE VALID OUTPUT (structure only — replace values with ones reasoned for
+5QI {sample_5qi} as above, and vary them packet to packet):
 {{
-  "extension_headers": [
-    {{"type": 133, "pdu_type": 0, "qfi": {sample_qfi}, "rqi": {sample_rqi}, "ppi": 0}}
-  ],
-  "outer_dscp": {ctx.dscp_marking},
-  "traffic_class": "benign",
-  "anomaly_type": "benign",
-  "reasoning": "<one sentence: which 5QI/service you assumed and why these values fit it>",
-  "target_bitrate_bps": "<int, bits/sec, this 5QI's real sustained bitrate>",
-  "inter_arrival_ms": "<float, ms, this 5QI's real packetization period>"
+  "packets": [
+    {{
+      "extension_headers": [
+        {{"type": 133, "pdu_type": 0, "qfi": {sample_qfi}, "rqi": {sample_rqi}, "ppi": 0}}
+      ],
+      "outer_dscp": {ctx.dscp_marking},
+      "traffic_class": "benign",
+      "anomaly_type": "benign",
+      "target_bitrate_bps": "<int, bits/sec>",
+      "inter_arrival_ms": "<float, ms>"
+    }}
+  ]
 }}
 
 Field bounds:
@@ -600,33 +662,37 @@ Field bounds:
 Use these EXACT field names, spelled correctly: extension_headers, outer_dscp,
 target_bitrate_bps, inter_arrival_ms.
 
-RESPOND ONLY WITH VALID JSON (no markdown formatting, no string placeholders —
-target_bitrate_bps and inter_arrival_ms must be actual numbers in your
-response, not the placeholder text shown above):
+RESPOND ONLY WITH VALID JSON: a single object with one key "packets" whose
+value is an array of EXACTLY {batch_size} packet objects as shown above. No
+markdown formatting, no placeholder strings — target_bitrate_bps and
+inter_arrival_ms must be actual numbers.
 """
+        # If the caller set an explicit ceiling, request exactly that so its
+        # effect is directly observable (generate() would otherwise clamp a
+        # smaller heuristic value down and the ceiling would never bind).
+        # Only fall back to a batch_size-based guess when no ceiling was set.
+        requested_max_tokens = self.max_output_tokens or max(2000, batch_size * 300)
+
         for attempt in range(1, max_retries + 1):
-            response = self.generate(prompt, system, temperature=0.3, max_tokens=500)
+            response = self.generate(prompt, system, max_tokens=requested_max_tokens)
             parsed = self._parse_json_response(response)
-            if parsed:
-                try:
-                    return self._sanitize_benign(parsed, ctx)
-                except Exception as e:
-                    print(f"[WARN] Exception during _sanitize_benign on attempt {attempt}: {e}")
-            print(f"[WARN] Failed to generate/parse benign JSON from Mistral on attempt {attempt}/{max_retries}")
+            raw_packets = parsed.get("packets") if isinstance(parsed, dict) else None
+            if isinstance(raw_packets, list) and raw_packets:
+                sanitized: List[Dict] = []
+                for i, raw_pkt in enumerate(raw_packets):
+                    try:
+                        sanitized.append(self._sanitize_benign(
+                            raw_pkt, ctx,
+                            reference_bitrate_bps=reference_bitrate_bps,
+                            reference_inter_arrival_ms=reference_inter_arrival_ms,
+                        ))
+                    except Exception as e:
+                        print(f"[WARN] Skipping malformed packet {i+1}/{len(raw_packets)} in batch call: {e}")
+                if sanitized:
+                    if len(sanitized) < batch_size:
+                        print(f"[TELEMETRY] Batch call returned {len(sanitized)}/{batch_size} usable packets.")
+                    return sanitized
+            print(f"[WARN] Failed to generate/parse batch JSON from Mistral on attempt {attempt}/{max_retries}")
 
-        print(f"[ERROR] Failed to generate benign packet after {max_retries} attempts.")
-        return None
-
-    def generate_benign_batch(self, ctx: SessionContext, batch_size: int = 5, max_retries_per_pkt: int = 3) -> List[Dict]:
-        """Generate a batch of benign baseline packets for the given session with slot retries and telemetry."""
-        batch = []
-        for slot in range(batch_size):
-            pkt = self.generate_benign(ctx, max_retries=max_retries_per_pkt)
-            if pkt:
-                batch.append(pkt)
-            else:
-                print(f"[WARN] Benign batch slot {slot+1}/{batch_size} failed after {max_retries_per_pkt} retries.")
-
-        if len(batch) < batch_size:
-            print(f"[TELEMETRY] Benign batch completed with reduced size: {len(batch)}/{batch_size} packets generated.")
-        return batch
+        print(f"[ERROR] Failed to generate a benign packet batch after {max_retries} attempts.")
+        return []

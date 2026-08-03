@@ -2,11 +2,10 @@
 
 # pyrefly: ignore [missing-import]
 import pytest
-from phase1_starter import (
-    MistralClient,
-    SessionContext,
-    GTP_U_Mutation,
-    ExtensionHeader,
+from mistral_client import MistralClient
+from session_context import SessionContext
+from packet_model import GTP_U_Mutation, ExtensionHeader
+from gtpu_scapy import (
     build_gtpu_packet,
     build_gtpu_packet_from_mutation,
     export_campaign_to_pcap,

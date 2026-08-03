@@ -195,16 +195,6 @@ def build_gtpu_packet_from_mutation(
     return build_gtpu_packet(payload=payload, **kwargs)
 
 
-def decode_gtpu_packet(data: bytes) -> GTP_U_Header:
-    """Decode bytes and require a GTP-U packet with a PDU Session Container."""
-    packet = GTP_U_Header(data)
-    if not isinstance(packet, GTP_U_Header):
-        raise ValueError("data is not a GTP-U packet")
-    if packet.gtp_type != 255 or packet.E != 1 or packet.next_ex != PDU_SESSION_CONTAINER_TYPE:
-        raise ValueError("packet does not contain a PDU Session Container extension")
-    return packet
-
-
 def export_campaign_to_pcap(
     mutations: List[Any],
     output_filename: str = "llm_gtpu_campaign.pcap",
@@ -241,7 +231,6 @@ __all__ = [
     "build_gtpu_packet",
     "build_gtpu_packet_from_mutation",
     "extract_container_kwargs",
-    "decode_gtpu_packet",
     "export_campaign_to_pcap",
 ]
 

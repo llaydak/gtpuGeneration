@@ -15,21 +15,15 @@ from datetime import datetime
 from typing import Optional, List, Dict
 
 from scapy.all import IP, UDP, ICMP, Raw, wrpcap
-from scapy.contrib.gtp import GTP_U_Header
 from scapy.utils import PcapWriter
-from phase1_starter import (
-    MistralClient,
-    SessionContext,
-    GTP_U_Mutation,
-    build_gtpu_packet_from_mutation,
-    MODEL_VARIANT,
-)
+from mistral_client import MistralClient
+from session_context import SessionContext
+from packet_model import GTP_U_Mutation
+from gtpu_scapy import build_gtpu_packet_from_mutation, MODEL_VARIANT
 
 # Table II of the reference paper (Nikolaidis et al., NOMS 2023): per-5QI
 # eMBB feature statistics. R5QI in bps, T5QI in ms, P5QI = R5QI*T5QI in bytes.
 TABLE_II_5QI_STATS = {
-    1: {"name": "Interactive Voice Calls", "r_bps": 100_000, "t_ms": 20.0, "p_bytes": 250, "d_ms": 80, "a": 0.086},
-    2: {"name": "Interactive Video Calls", "r_bps": 7_000_000, "t_ms": 20.0, "p_bytes": 17_500, "d_ms": 130, "a": 0.124},
     3: {"name": "Online Gaming", "r_bps": 15_000_000, "t_ms": 20.0, "p_bytes": 37_500, "d_ms": 30, "a": 0.019},
     4: {"name": "Buffered Video", "r_bps": 12_000_000, "t_ms": 100.0, "p_bytes": 150_000, "d_ms": 280, "a": 0.13},
     6: {"name": "Web Browsing", "r_bps": 5_000_000, "t_ms": 100.0, "p_bytes": 62_500, "d_ms": 280, "a": 0.641},
@@ -42,12 +36,7 @@ TABLE_II_5QI_STATS = {
 _PAYLOAD_SIZE_CV = 0.3
 
 # Max inner (ICMP) payload per wire packet. P5QI for some 5QIs (e.g. 62.5 KB
-# for web browsing) is far larger than a real Ethernet-MTU packet — no real
-# application sends a 60 KB datagram in one frame, an HTTP object that size
-# arrives as many MTU-sized segments. We split each sampled arrival into
-# segments this large instead, so the packet *count* reflects a real capture
-# (this is what makes 15 min of a 5 Mbps flow correctly imply ~250k+ packets,
-# not a few thousand oversized ones).
+# for web browsing) is far larger than a real Ethernet-MTU packet.
 _MAX_SEGMENT_BYTES = 1400
 # Gap between segments of the same burst (they arrive back-to-back on the wire).
 _INTRA_BURST_GAP_MS = 1.0
@@ -194,11 +183,6 @@ WEB_BROWSING_SESSION_TEID = 0xDEADBEEF  # Fixed TEID for the single Web Browsing
 # Used as a fallback advance when the LLM fails to return a packet.
 _5QI6_NOMINAL_T_MS = 100.0
 
-_GNODEB_IP_DEFAULT = "192.168.100.10"
-_UPF_IP_DEFAULT = "192.168.100.20"
-_UE_IP = "10.45.0.2"
-_REMOTE_IP = "8.8.8.8"
-
 
 def generate_timestamped_filename(
     prefix: str = "stream",
@@ -268,10 +252,12 @@ def create_web_browsing_stream(
     gnodeb_ip: str = "192.168.100.10",
     upf_ip: str = "192.168.100.20",
     mode: str = "stats",
-    llm_sample_every: int = 0,
     progress_every: int = 200,
     max_packets: Optional[int] = None,
     model_name: str = MODEL_VARIANT,
+    backend: str = "ollama",
+    max_output_tokens: Optional[int] = None,
+    llm_batch_size: int = 20,
 ) -> tuple:
     """Generate a 5QI 6 (Web Browsing) benign GTP-U stream for the given duration.
 
@@ -281,31 +267,10 @@ def create_web_browsing_stream(
         _sample_table_ii_packet). Session/header fields (QFI, RQI, DSCP) are
         deterministic from the session context. No LLM calls on the hot path,
         so 10+ minutes of simulated traffic generate in seconds.
-      - "llm" (slow): every packet's fields, including payload_size and
-        inter_arrival_ms, are produced by an LLM call — a real blocking
-        round-trip to the model server per packet (observed ~1-5s each), so
-        targeting a full duration_minutes is impractical (thousands of
-        packets = hours). Use max_packets instead to bound the run by a fixed,
-        predictable packet count for a small side-by-side comparison sample.
-
-    In "stats" mode, set llm_sample_every > 0 to additionally invoke the LLM
-    every Nth packet purely for telemetry (logged under "llm_samples" in the
-    telemetry JSON) without it gating the generated packet's fields.
-
-    Args:
-        duration_minutes: Simulated traffic duration to cover (default: 15 minutes).
-        output_dir: Directory where PCAP and telemetry JSON files will be saved.
-        gnodeb_ip: Outer IP address for gNodeB.
-        upf_ip: Outer IP address for UPF.
-        mode: "stats" or "llm".
-        llm_sample_every: In "stats" mode, sample the LLM every N packets for
-            telemetry comparison (0 disables).
-        progress_every: Print a progress line every N packets.
-        max_packets: If set, stop after this many packets regardless of
-            duration_minutes — gives a predictable wall-clock bound, mainly
-            useful for "llm" mode where duration alone doesn't.
-        model_name: Ollama model tag to use in "llm" mode (or "stats" mode's
-            llm_sample_every telemetry calls). Defaults to MODEL_VARIANT.
+      - "llm" (slow): payload_size and inter_arrival_ms come from LLM calls,
+        llm_batch_size packets per call (see MistralClient.generate_benign_batch).
+        Still much slower than "stats", so use max_packets to bound the run to
+        a predictable packet/call count instead of targeting a full duration.
 
     Returns:
         tuple: (path_to_pcap_file, path_to_telemetry_json)
@@ -315,10 +280,9 @@ def create_web_browsing_stream(
 
     target_duration_sec = duration_minutes * 60.0
     ctx = _make_web_browsing_session()
-    mistral = MistralClient(model_name=model_name)
+    mistral = MistralClient(model_name=model_name, backend=backend, max_output_tokens=max_output_tokens)
 
-    print("=" * 70)
-    print(f"5G GTP-U Web Browsing Baseline Stream Generator (5QI {WEB_BROWSING_5QI}, mode={mode}, model={model_name})")
+    print(f"5G GTP-U Web Browsing Baseline Stream Generator (5QI {WEB_BROWSING_5QI}, mode={mode}, backend={backend}, model={model_name})")
     print(f"Target simulated duration: {duration_minutes:.1f} minutes ({target_duration_sec:.0f} s)")
     if max_packets:
         print(f"Hard packet cap: {max_packets}")
@@ -331,7 +295,6 @@ def create_web_browsing_stream(
 
     packets: List = []  # used only in "llm" mode (small counts, kept as Scapy objects)
     telemetry_records: List[Dict] = []
-    llm_samples: List[Dict] = []
     base_inner_payload = IP(src="10.45.0.2", dst="8.8.8.8") / ICMP(type=8, code=0)
     fast_builder = _FastSessionPacketBuilder(ctx, gnodeb_ip, upf_ip) if mode == "stats" else None
     # "stats" mode writes raw bytes straight to disk as it goes (see
@@ -354,25 +317,59 @@ def create_web_browsing_stream(
 
     print(f"\n[Generating packets until {target_duration_sec:.0f} s of simulated traffic is covered...]\n")
 
+    llm_pending_queue: List[Dict] = []  # only used when llm_batch_size > 0
+
+    ref_stats = TABLE_II_5QI_STATS[WEB_BROWSING_5QI]
+
     try:
         while sim_elapsed_sec < target_duration_sec and (max_packets is None or seq < max_packets):
             if mode == "llm":
-                pkt_json = mistral.generate_benign(ctx, max_retries=3)
-                if pkt_json is None:
-                    print(f"[WARN] Packet #{seq + 1} failed after retries — skipping slot.")
-                    sim_elapsed_sec += _5QI6_NOMINAL_T_MS / 1000.0
-                    continue
-                batch = [(pkt_json["payload_size"], pkt_json["inter_arrival_ms"], pkt_json)]
+                if not llm_pending_queue:
+                    llm_pending_queue = mistral.generate_benign_batch(
+                        ctx, batch_size=llm_batch_size, max_retries=3,
+                        reference_bitrate_bps=ref_stats["r_bps"],
+                        reference_inter_arrival_ms=ref_stats["t_ms"],
+                    )
+                    if not llm_pending_queue:
+                        print(f"[WARN] Batch call failed after retries — skipping slot #{seq + 1}.")
+                        sim_elapsed_sec += _5QI6_NOMINAL_T_MS / 1000.0
+                        continue
+                pkt_json = llm_pending_queue.pop(0)
+                # Split the LLM's burst total into MTU-sized wire segments,
+                # same as _sample_table_ii_burst does for "stats" mode — a
+                # single 50KB+ frame isn't a realistic wire packet. Only the
+                # fields GTP_U_Mutation.from_json/telemetry actually read are
+                # carried per segment — not a full pkt_json copy (which would
+                # duplicate its sanitization_log/raw_model_output on every
+                # one of a burst's ~40-50 segments).
+                segment_base = {
+                    "teid": pkt_json.get("teid", ctx.teid),
+                    "extension_headers": pkt_json["extension_headers"],
+                    "outer_dscp": pkt_json["outer_dscp"],
+                    "anomaly_type": pkt_json.get("anomaly_type", "benign"),
+                    "reasoning": pkt_json.get("reasoning", ""),
+                    "raw_llm_compliant": pkt_json.get("raw_llm_compliant"),
+                    "session_consistent": pkt_json.get("session_consistent"),
+                }
+                segments = []
+                remaining = pkt_json["payload_size"]
+                while remaining > 0:
+                    seg = min(remaining, _MAX_SEGMENT_BYTES)
+                    segments.append(seg)
+                    remaining -= seg
+                batch = [
+                    (
+                        seg,
+                        pkt_json["inter_arrival_ms"] if i == 0 else _INTRA_BURST_GAP_MS,
+                        {
+                            **segment_base,
+                            "payload_size": seg,
+                            "inter_arrival_ms": pkt_json["inter_arrival_ms"] if i == 0 else _INTRA_BURST_GAP_MS,
+                        },
+                    )
+                    for i, seg in enumerate(segments)
+                ]
             else:
-                if llm_sample_every and (seq + 1) % llm_sample_every == 0:
-                    llm_pkt = mistral.generate_benign(ctx, max_retries=3)
-                    if llm_pkt is not None:
-                        llm_samples.append({
-                            "seq": seq + 1,
-                            "payload_size_bytes": llm_pkt.get("payload_size"),
-                            "inter_arrival_ms": llm_pkt.get("inter_arrival_ms"),
-                            "raw_llm_compliant": llm_pkt.get("raw_llm_compliant"),
-                        })
                 stats_meta = {
                     "raw_llm_compliant": None,
                     "session_consistent": True,
@@ -384,7 +381,6 @@ def create_web_browsing_stream(
 
             for payload_size, inter_arrival_ms, meta in batch:
                 seq += 1
-                pkt_time = current_sim_time + inter_arrival_ms / 1000.0
 
                 if mode == "llm":
                     wire_packet, inter_arrival_ms, payload_size = _build_wire_packet(
@@ -393,6 +389,7 @@ def create_web_browsing_stream(
                     packets.append(wire_packet)
                     total_bytes += len(wire_packet)
                 else:
+                    pkt_time = current_sim_time + inter_arrival_ms / 1000.0
                     raw_bytes = fast_builder.build(payload_size, seq)
                     pcap_writer.write_packet(
                         raw_bytes, sec=int(pkt_time), usec=int(round((pkt_time % 1) * 1_000_000))
@@ -431,8 +428,6 @@ def create_web_browsing_stream(
 
     llm_judged = [r for r in telemetry_records if r["raw_llm_compliant"] is not None]
 
-    ref_stats = TABLE_II_5QI_STATS[WEB_BROWSING_5QI]
-
     telemetry_data = {
         "experiment_type": "web_browsing_benign_llm_stream",
         "generation_mode": mode,
@@ -457,7 +452,11 @@ def create_web_browsing_stream(
             round(sum(1 for r in llm_judged if r["raw_llm_compliant"]) / len(llm_judged), 4)
             if llm_judged else None
         ),
-        "llm_samples": llm_samples,
+        "llm_usage": {
+            "api_call_count": mistral.call_count,
+            "total_prompt_tokens": mistral.total_prompt_tokens,
+            "total_completion_tokens": mistral.total_completion_tokens,
+        },
         "session_context": {
             "teid": hex(ctx.teid),
             "active_qfis": ctx.active_qfis,
@@ -470,9 +469,7 @@ def create_web_browsing_stream(
     with open(json_filename, "w") as f:
         json.dump(telemetry_data, f, indent=2)
 
-    print("\n" + "=" * 70)
-    print(" WEB BROWSING STREAM COMPLETED")
-    print("=" * 70)
+    print(" WEB BROWSING STREAM COMPLETED \n")
     print(f" PCAP file          : {pcap_filename}")
     print(f" Telemetry JSON     : {json_filename}")
     print(f" Packets generated  : {packet_count}")
@@ -482,6 +479,11 @@ def create_web_browsing_stream(
     print(f" Achieved bitrate   : {achieved_bps/1e6:.2f} Mbps (Table II R5QI={ref_stats['r_bps']/1e6:.2f} Mbps)")
     if telemetry_data["llm_compliance_rate"] is not None:
         print(f" LLM compliance     : {telemetry_data['llm_compliance_rate']*100:.1f}% ({len(llm_judged)} sampled)")
+    if mistral.call_count:
+        print(
+            f" LLM API calls      : {mistral.call_count} "
+            f"({mistral.total_prompt_tokens} prompt / {mistral.total_completion_tokens} completion tokens)"
+        )
     print("=" * 70)
 
     return pcap_filename, json_filename
@@ -508,15 +510,9 @@ if __name__ == "__main__":
         default="stats",
         help=(
             "'stats' (default): fast, payload/timing sampled from the paper's Table II "
-            "per-5QI stats, no LLM in the hot loop. 'llm': slow, every packet's fields "
-            "come from an LLM call (impractical beyond small demo runs)."
+            "per-5QI stats, no LLM in the hot loop. 'llm': slower, packet fields come "
+            "from LLM batch calls (impractical beyond small demo runs)."
         ),
-    )
-    parser.add_argument(
-        "--llm-sample-every",
-        type=int,
-        default=0,
-        help="In --mode stats, call the LLM every N packets for telemetry comparison only (0 disables).",
     )
     parser.add_argument(
         "--max-packets",
@@ -524,8 +520,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Stop after this many packets regardless of --duration. Use this with "
-            "--mode llm to bound wall-clock time to a predictable small sample "
-            "(each LLM packet is a real ~1-5s round-trip)."
+            "--mode llm to bound the run to a predictable, small packet/call count."
         ),
     )
     parser.add_argument(
@@ -533,8 +528,34 @@ if __name__ == "__main__":
         type=str,
         default=MODEL_VARIANT,
         help=(
-            f"Ollama model tag to use in --mode llm (default: {MODEL_VARIANT}). "
-            "Must already be pulled on the Ollama server (see `ollama list`)."
+            f"Model tag to use in --mode llm (default: {MODEL_VARIANT}). "
+            "For --backend ollama this must already be pulled on the Ollama server "
+            "(see `ollama list`). For --backend openai this is the OpenAI model id."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["ollama", "openai"],
+        default="ollama",
+        help=(
+            "'ollama' (default): local self-hosted model at SELF_HOSTED_MODELS_URL. "
+            "'openai': call the OpenAI API instead — requires OPENAI_API_KEY in the "
+            "environment and --model set to a valid OpenAI model id."
+        ),
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Ceiling applied to every LLM call's max_tokens (e.g. 50000). Default: no extra ceiling.",
+    )
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=20,
+        help=(
+            "In --mode llm, packets requested per LLM call (default: 20). Set this >= "
+            "--max-packets for a small test run to avoid a visible seam between batches."
         ),
     )
 
@@ -543,7 +564,9 @@ if __name__ == "__main__":
         duration_minutes=args.duration,
         output_dir=args.output_dir,
         mode=args.mode,
-        llm_sample_every=args.llm_sample_every,
         max_packets=args.max_packets,
         model_name=args.model,
+        backend=args.backend,
+        max_output_tokens=args.max_output_tokens,
+        llm_batch_size=args.llm_batch_size,
     )
