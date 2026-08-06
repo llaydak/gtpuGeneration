@@ -32,12 +32,6 @@ KNOWN_EXTENSION_TYPES = {
     0xC0: "nr_ran_container",          # 5G RAN User Plane Control (Xn-U/F1-U)
 }
 
-ALLOWED_ANOMALIES = {
-    "qfi_qer_mismatch",                 # QFI not provisioned or QER rule mismatch
-    "cross_flow_interference",          # Burst-based cross-flow QFI divergence
-    "timing_window_race",               # Two-stage PFCP propagation race condition
-}
-
 # 3GPP Specification Field Boundaries (TS 29.281, TS 38.415, RFC 2474)
 FIELD_BOUNDS = {
     "qfi": {"min": 0, "max": 63},

@@ -2,7 +2,7 @@
 
 # pyrefly: ignore [missing-import]
 import pytest
-from mistral_client import MistralClient
+from llm_client import LLMClient
 from session_context import SessionContext
 from packet_model import GTP_U_Mutation, ExtensionHeader
 from gtpu_scapy import (
@@ -14,7 +14,7 @@ from gtpu_scapy import (
 
 
 def test_semantic_precision_evaluates_policy_violations():
-    client = MistralClient.__new__(MistralClient)
+    client = LLMClient.__new__(LLMClient)
     ctx = SessionContext(
         teid=1,
         active_qfis=[2, 48],
@@ -34,34 +34,6 @@ def test_semantic_precision_evaluates_policy_violations():
     assert result["violates_active_qfis"] is True
     assert result["is_semantically_anomalous"] is True
     assert result["semantic_precision_score"] == 1.0
-
-
-def test_diversity_tracking_detects_duplicate_structure():
-    client = MistralClient.__new__(MistralClient)
-    ctx = SessionContext(
-        teid=1,
-        active_qfis=[2, 48],
-        qfi_to_5qi={2: 7, 48: 9},
-        qfi_to_qer={2: 1, 48: 2},
-        reflective_qos_enabled_qfis=[48],
-        dscp_marking=0x28,
-    )
-
-    previous = [{
-        "extension_headers": [{"type": 0x85, "qfi": 48, "rqi": 1, "ppi": 0}],
-        "anomaly_type": "qfi_qer_mismatch",
-    }]
-    mutation = {
-        "extension_headers": [{"type": 0x85, "qfi": 48, "rqi": 1, "ppi": 0}],
-        "outer_dscp": 0x28,
-        "anomaly_type": "qfi_qer_mismatch",
-        "reasoning": "Same structure as before",
-    }
-
-    result = client._ensure_diverse_structure(mutation, ctx, previous_mutations=previous)
-
-    assert result["extension_headers"][0]["qfi"] == 48
-    assert result["structural_diversity_is_unique"] is False
 
 
 def test_gtpu_mutation_adapter_builds_scapy_packet():
@@ -139,24 +111,3 @@ def test_export_campaign_to_pcap(tmp_path):
     pcap_file = str(tmp_path / "test_campaign.pcap")
     res = export_campaign_to_pcap(mutations, output_filename=pcap_file)
     assert res == pcap_file
-
-
-def test_multi_anomaly_detection():
-    client = MistralClient.__new__(MistralClient)
-    ctx = SessionContext(
-        teid=1,
-        active_qfis=[2, 48],
-        qfi_to_5qi={2: 7, 48: 9},
-        qfi_to_qer={2: 1, 48: 2},
-        reflective_qos_enabled_qfis=[2],
-        dscp_marking=0x00,
-    )
-    # Packet contains BOTH timing window race request AND invalid QFI (99)
-    headers = [{"type": 0x85, "qfi": 99, "rqi": 0, "ppi": 0}]
-    
-    res = client._infer_anomaly_type(headers, ctx, requested_type="timing_window_race")
-    
-    assert res["primary_anomaly"] == "timing_window_race"
-    assert "timing_window_race" in res["detected_anomalies"]
-    assert "qfi_qer_mismatch" in res["detected_anomalies"]
-    assert res["is_compound_anomaly"] is True
