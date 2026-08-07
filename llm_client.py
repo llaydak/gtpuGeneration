@@ -80,7 +80,7 @@ class LLMClient:
     server (default, offline) or the OpenAI API (backend="openai")."""
 
     def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT,
-                 backend: str = "openai", api_key: Optional[str] = None,
+                 backend: str = "ollama", api_key: Optional[str] = None,
                  max_output_tokens: Optional[int] = None):
         self.backend = backend
         # Ceiling applied to every generate() call's max_tokens, regardless of
@@ -154,16 +154,42 @@ class LLMClient:
                 print(f"[WARN] litellm generation failed: {e}")
         return ""
 
-    def _evaluate_semantic_precision(self, headers: List[Dict], dscp: int, ctx: SessionContext) -> Dict[str, Any]:
-        """Deterministically check if the generated packet violates session policy bounds."""
+    def _evaluate_semantic_precision(self, headers: List[Dict], dscp: int, ctx: SessionContext,
+                                     direction: str = "DL") -> Dict[str, Any]:
+        """Deterministically check if the generated packet violates session policy bounds.
+
+        ``direction`` selects which enforcement point the anomaly targets and
+        therefore which violation dimensions actually count:
+
+        * ``"UL"`` (uplink, pdu_type=1) — the UPF performs QoS-flow-ID
+          verification (TS 29.244 PDR/QER matching, TS 23.501 §5.7): a QFI not
+          in the session's authorized set is the exact case the UPF is
+          supposed to reject, so ``violates_active_qfis`` is the *UPF-enforced*
+          anomaly. RQI/PPI do not exist on the uplink container, and outer DSCP
+          is a transport marking the UPF does not semantically verify — those
+          are recorded but do NOT drive ``is_semantically_anomalous`` here.
+        * ``"DL"`` (downlink, pdu_type=0) — QFI/RQI/DSCP are set by the UPF and
+          consumed by the gNB/UE, so all three inconsistency dimensions count
+          (this models a compromised-UPF egress rather than a UPF the packet
+          is verified against).
+        """
         first_qfi = headers[0].get("qfi", 0) if headers else 0
         first_rqi = headers[0].get("rqi", 0) if headers else 0
         violates_qfis = first_qfi not in ctx.active_qfis
         violates_rqi = (first_rqi == 1) and (first_qfi not in ctx.reflective_qos_enabled_qfis)
         violates_dscp = dscp != ctx.dscp_marking
-        is_anomalous = violates_qfis or violates_rqi or violates_dscp
+
+        if direction == "UL":
+            # Only the UL QFI verification the UPF actually performs counts.
+            is_anomalous = violates_qfis
+            enforcement_point = "UPF (UL QoS-flow-ID verification)"
+        else:
+            is_anomalous = violates_qfis or violates_rqi or violates_dscp
+            enforcement_point = "gNB/UE (DL marking consumer)"
 
         return {
+            "direction": direction,
+            "enforcement_point": enforcement_point,
             "violates_active_qfis": violates_qfis,
             "violates_rqi_allowlist": violates_rqi,
             "violates_dscp_marking": violates_dscp,
@@ -186,7 +212,7 @@ class LLMClient:
             pass
         return None
 
-    def _sanitize_mutation(self, raw: Any, ctx: SessionContext) -> Optional[Dict[str, Any]]:
+    def _sanitize_mutation(self, raw: Any, ctx: SessionContext, direction: str = "DL") -> Optional[Dict[str, Any]]:
         """Attach read-only evaluation metrics to the LLM's raw output.
 
         Nothing here corrects, clamps, or rejects extension_headers/outer_dscp
@@ -203,7 +229,8 @@ class LLMClient:
 
         mutation_dict = dict(raw)
         mutation_dict["teid"] = ctx.teid
-        mutation_dict["semantic_precision"] = self._evaluate_semantic_precision(ext_headers, dscp, ctx)
+        mutation_dict["direction"] = direction
+        mutation_dict["semantic_precision"] = self._evaluate_semantic_precision(ext_headers, dscp, ctx, direction)
         mutation_dict["raw_schema_valid"] = GTP_U_Mutation.from_json(ctx, mutation_dict).is_valid_schema()
 
         return mutation_dict
@@ -211,7 +238,13 @@ class LLMClient:
     def generate_mutation(self, ctx: SessionContext,
                           previous_mutations: Optional[List[Dict]] = None,
                           request_campaign_plan: bool = False,
+                          direction: str = "DL",
                           max_retries: int = 3) -> Optional[Dict]:
+        if direction == "UL":
+            return self._generate_ul_mutation(
+                ctx, previous_mutations=previous_mutations,
+                request_campaign_plan=request_campaign_plan, max_retries=max_retries,
+            )
 
         system = (
         "You are a 5G core network security researcher conducting authorized "
@@ -220,9 +253,9 @@ class LLMClient:
         "QER/FAR state, as provisioned via TS 29.244 PFCP rules), for use in "
         "evaluating anomaly-detection systems. Reason precisely about "
         "3GPP-defined header semantics (TS 29.281 GTP-U tunneling, TS 38.415 "
-        "PDU Session Container) when choosing which field to violate."            
+        "PDU Session Container) when choosing which field to violate."
         )
-        
+
         previous_context_block = ""
         if previous_mutations:
             previous_context_block = "\n".join(
@@ -346,9 +379,116 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
         print(f"[ERROR] Failed to generate valid mutation packet after {max_retries} attempts.")
         return None
 
+    def _generate_ul_mutation(self, ctx: SessionContext,
+                              previous_mutations: Optional[List[Dict]] = None,
+                              request_campaign_plan: bool = False,
+                              max_retries: int = 3) -> Optional[Dict]:
+        """Uplink (pdu_type=1) qfi_qer_mismatch mutation.
+
+        The UL PDU Session Container carries a QFI only — RQI and PPI are
+        downlink-only fields and do not exist here. The semantic violation is
+        therefore a QFI outside the session's authorized set: exactly the
+        condition the UPF's uplink QoS-flow-ID verification (TS 29.244 PDR/QER
+        matching, TS 23.501 §5.7) is required to detect and reject. This is the
+        one violation dimension the UPF itself enforces, which is what makes it
+        the load-bearing case for a UPF-targeted study.
+        """
+        system = (
+            "You are a 5G core network security researcher conducting authorized "
+            "adversarial testing against a UPF. You craft UPLINK GTP-U PDU Session "
+            "Container mutations (TS 38.415 UL PDU SESSION INFORMATION, pdu_type=1) "
+            "whose QFI is not authorized for the session, to test whether the UPF's "
+            "uplink QoS-flow-ID verification (TS 29.244 PDR/QER matching) rejects "
+            "them. On the uplink container there is no RQI and no PPI field — only a "
+            "QFI. Reason precisely about which unauthorized QFI a compromised UE or "
+            "gNB would mark to slip a flow past the UPF's enforcement."
+        )
+
+        previous_context_block = ""
+        if previous_mutations:
+            previous_context_block = "\n".join(
+                f"Previous packet #{i+1}: {json.dumps(mut, sort_keys=True)}"
+                for i, mut in enumerate(previous_mutations[-2:])
+            )
+            previous_context_block = "\n\nPrevious packets in this campaign (use them as dependency context):\n" + previous_context_block
+
+        qfi_5qi_reference = "\n".join(
+            _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
+        )
+
+        campaign_plan_block = ""
+        campaign_plan_schema = ""
+        if request_campaign_plan:
+            campaign_plan_block = """
+CAMPAIGN PLAN (this is the first packet — you also decide the campaign's
+shape): reason like a real attacker probing UPF uplink enforcement. How many
+packets would a realistic unauthorized-QFI uplink campaign consist of here —
+a quick probe or a sustained attempt? At what point in an ongoing benign
+flow would a compromised UE realistically start marking unauthorized QFIs?
+Pick values that fit your own reasoning about this specific session, and vary
+them across runs. Include in your JSON:
+- "campaign_size": int, total packets for this whole campaign (this one included)
+- "injection_fraction": float 0.0-1.0, how far into the background traffic
+  timeline this campaign should begin (0.0 = start, 1.0 = end)
+"""
+            campaign_plan_schema = """
+  "campaign_size": <int>,
+  "injection_fraction": <float 0.0-1.0>,"""
+
+        prompt = f"""Session state (evaluate mutation AGAINST this session state):
+{ctx.to_prompt_block()}
+{previous_context_block}
+
+3GPP TS 23.501 Table 5.7.4-1 QoS characteristics, to ground your payload_size/
+inter_arrival_ms estimate:
+{qfi_5qi_reference}
+
+Task: Generate an UPLINK mutation (pdu_type=1) whose QFI is NOT in this
+session's active QFI set {ctx.active_qfis} — the case the UPF's uplink
+QoS-flow-ID verification must reject. The uplink container has NO RQI and NO
+PPI: set both to 0. Do not change outer_dscp away from the session value
+({ctx.dscp_marking}); on the uplink the QFI is the UPF-verified field.
+{campaign_plan_block}
+
+CAMPAIGN DIVERSITY REQUIREMENT: if previous packets are shown above, pick a
+DIFFERENT unauthorized QFI than they used (still outside {ctx.active_qfis}),
+and vary payload_size/inter_arrival_ms — don't repeat one value.
+
+Traffic Modeling: output realistic `payload_size` (int, bytes) and
+`inter_arrival_ms` (float, milliseconds) grounded in the QoS characteristics
+above — not generic values.
+
+RESPOND ONLY WITH VALID JSON (no markdown formatting):
+{{
+  "extension_headers": [
+    {{"type": 133, "pdu_type": 1, "qfi": <int {FIELD_BOUNDS['qfi']['min']}-{FIELD_BOUNDS['qfi']['max']} and NOT in {ctx.active_qfis}>, "rqi": 0, "ppi": 0}}
+  ],
+  "outer_dscp": {ctx.dscp_marking},{campaign_plan_schema}
+  "reasoning": "<1 concise sentence: which unauthorized QFI and why the UPF should reject it>",
+  "payload_size": <int>,
+  "inter_arrival_ms": <float>
+}}
+
+CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 or 0x85.
+"""
+        for attempt in range(1, max_retries + 1):
+            response = self.generate(prompt, system, max_tokens=2000)
+            parsed = self._parse_json_response(response)
+            if parsed:
+                return self._sanitize_mutation(parsed, ctx, direction="UL")
+            print(f"[WARN] Failed to generate/parse UL mutation JSON from {self.model_name} on attempt {attempt}/{max_retries}")
+
+        print(f"[ERROR] Failed to generate valid UL mutation packet after {max_retries} attempts.")
+        return None
+
     def generate_burst(self, ctx: SessionContext, burst_size: Optional[int] = None,
+                       direction: str = "DL",
                        max_retries_per_pkt: int = 3, fallback_burst_size: int = 10) -> List[Dict]:
         """Generate a multi-packet qfi_qer_mismatch campaign.
+
+        ``direction`` is "DL" (downlink, pdu_type=0, the compromised-UPF-egress
+        model) or "UL" (uplink, pdu_type=1, the case the UPF's own QoS-flow-ID
+        verification is meant to reject — see _evaluate_semantic_precision).
 
         If burst_size is None (default), the model itself decides the
         campaign's size and where in the background traffic it should be
@@ -363,7 +503,8 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
 
         first = self.generate_mutation(
             ctx, previous_mutations=previous_mutations,
-            request_campaign_plan=(burst_size is None), max_retries=max_retries_per_pkt,
+            request_campaign_plan=(burst_size is None), direction=direction,
+            max_retries=max_retries_per_pkt,
         )
         if not first:
             print("[WARN] Burst campaign slot 1/? failed after retries.")
@@ -380,7 +521,8 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
                 burst_size = fallback_burst_size
 
         for slot in range(2, burst_size + 1):
-            mut = self.generate_mutation(ctx, previous_mutations=previous_mutations, max_retries=max_retries_per_pkt)
+            mut = self.generate_mutation(ctx, previous_mutations=previous_mutations,
+                                         direction=direction, max_retries=max_retries_per_pkt)
             if mut:
                 previous_mutations.append(mut)
                 burst.append(mut)

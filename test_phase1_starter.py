@@ -1,4 +1,4 @@
-"""Unit test suite for GTP-U generation, session context rules, and PCAP export."""
+"""Unit test suite for GTP-U packet construction and session context rules."""
 
 # pyrefly: ignore [missing-import]
 import pytest
@@ -8,7 +8,6 @@ from packet_model import GTP_U_Mutation, ExtensionHeader
 from gtpu_scapy import (
     build_gtpu_packet,
     build_gtpu_packet_from_mutation,
-    export_campaign_to_pcap,
     GTPUPDUSessionContainer,
 )
 
@@ -34,6 +33,41 @@ def test_semantic_precision_evaluates_policy_violations():
     assert result["violates_active_qfis"] is True
     assert result["is_semantically_anomalous"] is True
     assert result["semantic_precision_score"] == 1.0
+
+
+def test_ul_semantic_precision_only_qfi_is_upf_enforced():
+    """Uplink: an unauthorized QFI is the UPF-verified anomaly; RQI/DSCP are not."""
+    client = LLMClient.__new__(LLMClient)
+    ctx = SessionContext(
+        teid=1,
+        active_qfis=[6],
+        qfi_to_5qi={6: 6},
+        qfi_to_qer={6: 1},
+        reflective_qos_enabled_qfis=[],
+        dscp_marking=0x00,
+    )
+
+    # QFI not in the active set -> UPF QoS-flow-ID verification anomaly.
+    bad = client._evaluate_semantic_precision([{"qfi": 9, "rqi": 0}], dscp=0x00, ctx=ctx, direction="UL")
+    assert bad["violates_active_qfis"] is True
+    assert bad["is_semantically_anomalous"] is True
+    assert bad["enforcement_point"].startswith("UPF")
+
+    # An authorized-QFI uplink packet is NOT flagged, even with a mismatched
+    # DSCP — the UPF does not semantically verify the uplink transport marking.
+    ok = client._evaluate_semantic_precision([{"qfi": 6, "rqi": 0}], dscp=0x2E, ctx=ctx, direction="UL")
+    assert ok["is_semantically_anomalous"] is False
+
+
+def test_ul_mutation_builds_uplink_container():
+    """A pdu_type=1 mutation serializes as a UL PDU Session Container (QFI only)."""
+    raw_dict = {
+        "teid": 0xDEADBEEF,
+        "extension_headers": [{"type": 0x85, "qfi": 9, "rqi": 0, "ppi": 0, "pdu_type": 1}],
+    }
+    pkt = build_gtpu_packet_from_mutation(raw_dict)
+    assert pkt[GTPUPDUSessionContainer].type == 1  # UL PDU SESSION INFORMATION
+    assert pkt[GTPUPDUSessionContainer].QFI == 9
 
 
 def test_gtpu_mutation_adapter_builds_scapy_packet():
@@ -101,13 +135,3 @@ def test_build_gtpu_packet_raises_value_error_on_ul_rqi_ppi():
 
     with pytest.raises(ValueError, match="RQI and PPI fields are downlink"):
         build_gtpu_packet(teid=1234, qfi=48, ppi=3, pdu_type=1)
-
-
-def test_export_campaign_to_pcap(tmp_path):
-    mutations = [
-        {"teid": 0x1234, "extension_headers": [{"type": 0x85, "qfi": 2, "rqi": 0}]},
-        {"teid": 0x1234, "extension_headers": [{"type": 0x85, "qfi": 48, "rqi": 1}]},
-    ]
-    pcap_file = str(tmp_path / "test_campaign.pcap")
-    res = export_campaign_to_pcap(mutations, output_filename=pcap_file)
-    assert res == pcap_file

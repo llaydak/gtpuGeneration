@@ -6,6 +6,8 @@ combination that violates the session's QER/FAR policy.
 """
 
 import json
+import os
+import random
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -19,36 +21,75 @@ from generate_llm_pcap import (
     create_web_browsing_stream,
     generate_timestamped_filename,
     _make_web_browsing_session,
+    _UE_IP,
+    _WEB_SERVER_IP,
+    _WEB_SERVER_PORT,
 )
 
 
-def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, upf_ip: str, sim_time: float):
+def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, upf_ip: str,
+                         sim_time: float, direction: str = "DL"):
     """Convert one LLM mutation dict into a timestamped Scapy wire packet.
 
-    The T-PDU is a real inner IP/TCP frame (matching the benign path's
-    "10.45.0.2 -> 8.8.8.8" web-browsing pattern, see
-    create_web_browsing_stream's base_inner_payload), not raw filler bytes —
-    otherwise Wireshark's GTP-U dissector tries to parse the filler as IP and
-    flags the packet as malformed, which would make attack packets trivially
-    distinguishable from a structural artifact instead of the intended
-    QFI/RQI/DSCP policy violation. The outer IP's ToS also carries the
-    mutation's own (possibly violating) outer_dscp, not the session's
-    expected one — a DSCP-violation mutation must actually carry the wrong
-    DSCP on the wire, not just in telemetry.
+    The T-PDU is a real inner IP/TCP frame matching the benign path's
+    web-browsing pattern, not raw filler bytes — otherwise Wireshark's GTP-U
+    dissector tries to parse the filler as IP and flags the packet as
+    malformed, which would make attack packets trivially distinguishable from
+    a structural artifact instead of the intended QFI/RQI/DSCP policy
+    violation. Per-packet randomized IP ID / ephemeral port / sequence number
+    and high-entropy payload all mirror the benign path for the same reason.
+    The outer IP's ToS carries the mutation's own (possibly violating)
+    outer_dscp, not the session's expected one — a DSCP-violation mutation
+    must actually carry the wrong DSCP on the wire, not just in telemetry.
+
+    ``direction`` selects the on-wire orientation:
+
+    * ``"DL"`` — downlink G-PDU. Outer tunnel runs UPF -> gNB; inner T-PDU runs
+      web server -> UE (matching the benign background). Models a
+      compromised-UPF egress.
+    * ``"UL"`` — uplink G-PDU. Outer tunnel runs gNB -> UPF; inner T-PDU runs
+      UE -> web server. This is the direction the UPF verifies the marked QFI
+      against the session's authorized set, so it is the case an unauthorized
+      QFI is meant to probe.
     """
     gtp_mutation = GTP_U_Mutation.from_json(ctx, mutation)
 
+    if direction == "UL":
+        inner_src, inner_dst = _UE_IP, _WEB_SERVER_IP
+        tcp_sport, tcp_dport = random.randint(1024, 65535), _WEB_SERVER_PORT
+        outer_src, outer_dst = gnodeb_ip, upf_ip
+    else:
+        inner_src, inner_dst = _WEB_SERVER_IP, _UE_IP
+        tcp_sport, tcp_dport = _WEB_SERVER_PORT, random.randint(1024, 65535)
+        outer_src, outer_dst = upf_ip, gnodeb_ip
+
     base_inner_payload = (
-        IP(src="10.45.0.2", dst="8.8.8.8")
-        / TCP(sport=51820, dport=80, flags="PA", seq=1000, ack=1000)
+        IP(
+            src=inner_src,
+            dst=inner_dst,
+            id=random.randint(0, 0xFFFF),
+            ttl=random.randint(52, 62),
+        )
+        / TCP(
+            sport=tcp_sport,
+            dport=tcp_dport,
+            flags="PA",
+            seq=random.randint(0, 0xFFFFFFFF),
+            ack=random.randint(400, 2000),
+        )
     )
     payload_size = mutation.get("payload_size") or 0
     pad_len = max(0, payload_size - len(base_inner_payload))
-    payload = base_inner_payload / Raw(load=b"X" * pad_len) if pad_len > 0 else base_inner_payload
+    payload = base_inner_payload / Raw(load=os.urandom(pad_len)) if pad_len > 0 else base_inner_payload
 
     gtp_packet = build_gtpu_packet_from_mutation(gtp_mutation, payload=payload)
     wire_packet = (
-        IP(src=gnodeb_ip, dst=upf_ip, tos=gtp_mutation.outer_dscp << 2)
+        IP(
+            src=outer_src,
+            dst=outer_dst,
+            tos=gtp_mutation.outer_dscp << 2,
+            id=random.randint(0, 0xFFFF),
+        )
         / UDP(sport=2152, dport=2152)
         / gtp_packet
     )
@@ -60,6 +101,7 @@ def create_injected_attack_stream(
     background_duration_minutes: float = 1.0,
     burst_size: Optional[int] = None,
     injection_fraction: Optional[float] = None,
+    direction: str = "DL",
     output_dir: str = "pcap_files",
     gnodeb_ip: str = "192.168.100.10",
     upf_ip: str = "192.168.100.20",
@@ -105,7 +147,7 @@ def create_injected_attack_stream(
     print(ctx.to_prompt_block())
     print()
 
-    mutations = llm.generate_burst(ctx, burst_size=burst_size, max_retries_per_pkt=3)
+    mutations = llm.generate_burst(ctx, burst_size=burst_size, direction=direction, max_retries_per_pkt=3)
     if not mutations:
         raise RuntimeError("LLM failed to generate any attack packets for this campaign.")
 
@@ -127,7 +169,7 @@ def create_injected_attack_stream(
     sim_time = injection_time
     for i, mutation in enumerate(mutations, start=1):
         sim_time += (mutation.get("inter_arrival_ms") or 20.0) / 1000.0
-        attack_packets.append(_build_attack_packet(ctx, mutation, gnodeb_ip, upf_ip, sim_time))
+        attack_packets.append(_build_attack_packet(ctx, mutation, gnodeb_ip, upf_ip, sim_time, direction=direction))
         qfi = mutation["extension_headers"][0]["qfi"]
         is_violation = mutation["semantic_precision"]["is_semantically_anomalous"]
         print(f"  Attack pkt #{i} | qfi={qfi:2d} | raw_schema_valid={mutation['raw_schema_valid']} | policy_violation={is_violation}")
@@ -148,6 +190,7 @@ def create_injected_attack_stream(
 
     telemetry_data = {
         "experiment_type": "benign_plus_injected_qfi_qer_mismatch_attack",
+        "attack_direction": direction,
         "model_name": model_name,
         "timestamp": datetime.now().isoformat(),
         "pcap_file": pcap_filename,
@@ -169,6 +212,7 @@ def create_injected_attack_stream(
             "teid": hex(ctx.teid),
             "active_qfis": ctx.active_qfis,
             "qfi_to_5qi": ctx.qfi_to_5qi,
+            "reflective_qos_enabled_qfis": ctx.reflective_qos_enabled_qfis,
             "dscp_marking": hex(ctx.dscp_marking),
         },
         "attack_mutations": mutations,
@@ -202,6 +246,8 @@ if __name__ == "__main__":
     parser.add_argument("--background-duration", type=float, default=1.0, help="Background traffic duration in minutes (default: 1.0).")
     parser.add_argument("--burst-size", type=int, default=None, help="Packets in the injected attack campaign. Default: unset — the model decides the campaign size itself.")
     parser.add_argument("--injection-fraction", type=float, default=None, help="Where in the background stream to inject the attack, 0-1. Default: unset — the model decides where in the traffic to strike.")
+    parser.add_argument("--direction", choices=["DL", "UL"], default="DL",
+                        help="Attack orientation. 'UL' (uplink, pdu_type=1) is the QFI the UPF's own QoS-flow-ID verification is meant to reject; 'DL' (downlink, pdu_type=0, default) models a compromised-UPF egress.")
     parser.add_argument("--output-dir", type=str, default="pcap_files")
     parser.add_argument("--model", type=str, default=MODEL_VARIANT)
     parser.add_argument("--backend", choices=["ollama", "openai"], default="ollama")
@@ -214,6 +260,7 @@ if __name__ == "__main__":
         background_duration_minutes=args.background_duration,
         burst_size=args.burst_size,
         injection_fraction=args.injection_fraction,
+        direction=args.direction,
         output_dir=args.output_dir,
         model_name=args.model,
         backend=args.backend,

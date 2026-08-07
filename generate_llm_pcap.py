@@ -7,6 +7,7 @@ Supports:
 
 import os
 import json
+import random
 import time
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -30,8 +31,55 @@ TABLE_II_5QI_STATS = {\
 # byte count is far larger than a real Ethernet-MTU packet, so it gets split
 # into segments this size.
 _MAX_SEGMENT_BYTES = 1400
-# Gap between segments of the same burst (they arrive back-to-back on the wire).
-_INTRA_BURST_GAP_MS = 1.0
+
+# Segments of one burst arrive back-to-back at N3 line rate, so their spacing
+# is the packet's serialization time (bytes*8/link_rate), not a fixed constant.
+# A previously hardcoded 1.0ms gap put 98% of all inter-packet gaps at exactly
+# 1.000ms — physically impossible on a real link and a glaring synthetic
+# signature. 1 Gbps is a typical gNB-to-UPF N3 backhaul rate.
+_N3_LINK_BPS = 1_000_000_000
+# Multiplicative jitter on serialization delay, standing in for queueing /
+# scheduling variation so gaps aren't perfectly deterministic either. Widened
+# from a near-constant band so the intra-burst spacing isn't a single spike a
+# statistical IDS could separate on.
+_INTRA_BURST_JITTER_RANGE = (1.0, 4.0)
+# Occasional larger gap within a burst, modelling an ACK-clock / RAN-scheduler
+# pause rather than an uninterrupted line-rate drain. Kept rare/small so the
+# accumulated intra-burst time stays a low-single-digit % of the run and the
+# achieved bitrate remains tied to the LLM's burst-arrival gaps.
+_INTRA_BURST_PAUSE_PROB = 0.03
+_INTRA_BURST_PAUSE_RANGE_MS = (0.2, 0.8)
+# Floor so a tiny segment still can't produce a zero/degenerate gap.
+_MIN_INTRA_BURST_GAP_MS = 0.005
+
+# Real downlink web-browsing packet sizes are bimodal, not a single MTU spike:
+# a dominant mode of large data segments plus a minority of small packets
+# (small-object responses, TLS/HTTP-2 control records, response tails). Each
+# burst's byte budget is re-sliced into that mix so the size histogram matches
+# real traffic, while the burst TOTAL — and therefore the achieved bitrate — is
+# preserved exactly.
+_SMALL_SEGMENT_FRACTION = 0.25          # share of segments drawn from the small mode
+_SMALL_SEGMENT_RANGE = (40, 400)        # bytes (40 ≈ header-only / ACK-sized)
+_LARGE_SEGMENT_RANGE = (1000, _MAX_SEGMENT_BYTES)
+
+
+def _segment_burst_sizes(total_bytes: int) -> List[int]:
+    """Slice a burst's total byte budget into a realistic bimodal mix of wire
+    segment sizes (large data segments plus a minority of small packets)
+    instead of a uniform train of MTU frames. The sum is preserved exactly, so
+    re-segmenting does not change the burst's contribution to the bitrate.
+    """
+    sizes: List[int] = []
+    remaining = total_bytes
+    while remaining > 0:
+        if random.random() < _SMALL_SEGMENT_FRACTION:
+            seg = random.randint(*_SMALL_SEGMENT_RANGE)
+        else:
+            seg = random.randint(*_LARGE_SEGMENT_RANGE)
+        seg = min(seg, remaining)
+        sizes.append(seg)
+        remaining -= seg
+    return sizes
 
 # Fixed session for 5QI 6 (Web Browsing): single QFI, known DSCP.
 # 3GPP TS 23.501 Table 5.7.4-1: 5QI 6 = Non-GBR, Priority 60, PDB 300ms, PER 1e-6
@@ -70,10 +118,23 @@ def _make_web_browsing_session() -> SessionContext:
     )
 
 
+# Inner T-PDU endpoints. This stream is DOWNLINK (pdu_type=0 = DL PDU Session
+# Information per TS 38.415), so the inner packet travels server -> UE and the
+# outer GTP-U tunnel travels UPF -> gNB. Downlink is also the direction that
+# carries the byte volume in web browsing: the uplink side is small HTTP
+# requests, the downlink side is the large page/asset responses this stream
+# models.
+_UE_IP = "10.45.0.2"
+_WEB_SERVER_IP = "93.184.216.34"
+# Modern web browsing is overwhelmingly TLS on 443, not cleartext port 80 —
+# which also makes the high-entropy payload below self-consistent (encrypted
+# bytes are incompressible; cleartext HTTP would not be).
+_WEB_SERVER_PORT = 443
+
+
 def _build_wire_packet(
     ctx: SessionContext,
     pkt_json: Dict,
-    base_inner_payload,
     gnodeb_ip: str,
     upf_ip: str,
     seq: int,
@@ -81,6 +142,21 @@ def _build_wire_packet(
 ):
     """Convert a single LLM packet dict into a timestamped Scapy wire packet.
 
+    This is a DOWNLINK G-PDU: the outer tunnel runs UPF -> gNB and the inner
+    T-PDU runs web server -> UE, which is what pdu_type=0 (DL PDU Session
+    Information, TS 38.415) actually means. Emitting DL-marked containers on
+    a gNB -> UPF / UE -> server packet, as this previously did, contradicts
+    the spec at both layers.
+
+    Builds the inner T-PDU as a TCP segment using this segment's own
+    tcp_dport/tcp_seq/tcp_ack/tcp_flags (see the per-burst TCP connection
+    profile assigned in create_web_browsing_stream) — each burst is its own
+    connection with its own ephemeral UE-side port and initial sequence
+    number, and sequence numbers advance across a burst's MTU segments, so a
+    packet analyzer sees distinct, internally-consistent TCP flows rather
+    than one static segment repeated on every wire packet. IP IDs are drawn
+    per packet (RFC 6864) instead of left at Scapy's constant default, and
+    the payload is high-entropy random bytes rather than repeated filler.
     Pads the inner payload to match the LLM's requested payload_size and
     advances the PCAP timestamp by inter_arrival_ms.
 
@@ -90,8 +166,27 @@ def _build_wire_packet(
     mutation = GTP_U_Mutation.from_json(ctx, pkt_json)
 
     payload_size = mutation.payload_size if mutation.payload_size else 250
-    pad_len = max(0, payload_size - len(base_inner_payload))
-    actual_payload = base_inner_payload / Raw(load=b"X" * pad_len) if pad_len > 0 else base_inner_payload
+    inner_ip_tcp = (
+        IP(
+            src=_WEB_SERVER_IP,
+            dst=_UE_IP,
+            id=random.randint(0, 0xFFFF),
+            ttl=pkt_json["inner_ttl"],
+        )
+        / TCP(
+            sport=_WEB_SERVER_PORT,
+            dport=pkt_json["tcp_dport"],
+            seq=pkt_json["tcp_seq"],
+            ack=pkt_json["tcp_ack"],
+            flags=pkt_json["tcp_flags"],
+        )
+    )
+    pad_len = max(0, payload_size - len(inner_ip_tcp))
+    # Random bytes, not repeated filler: this models TLS-encrypted application
+    # data, which is incompressible/high-entropy. Constant filler leaves a
+    # zero-entropy signature that an entropy- or compression-ratio-based
+    # detector can separate on, independently of the QoS anomaly under study.
+    actual_payload = inner_ip_tcp / Raw(load=os.urandom(pad_len)) if pad_len > 0 else inner_ip_tcp
 
     gtp_packet = build_gtpu_packet_from_mutation(mutation, payload=actual_payload)
     gtp_packet.seq = seq % 0x10000  # GTP sequence number is a 16-bit field
@@ -99,7 +194,12 @@ def _build_wire_packet(
     inter_arrival_ms = mutation.inter_arrival_ms if mutation.inter_arrival_ms else _5QI6_NOMINAL_T_MS
 
     wire_packet = (
-        IP(src=gnodeb_ip, dst=upf_ip, tos=ctx.dscp_marking << 2)
+        IP(
+            src=upf_ip,
+            dst=gnodeb_ip,
+            tos=ctx.dscp_marking << 2,
+            id=random.randint(0, 0xFFFF),
+        )
         / UDP(sport=2152, dport=2152)
         / gtp_packet
     )
@@ -142,13 +242,6 @@ def create_web_browsing_stream(
 
     packets: List = []
     telemetry_records: List[Dict] = []
-    # 5QI 6 (Web Browsing) is defined by TS 23.501 Table 5.7.4-1 as TCP-based
-    # app traffic (www, e-mail, chat, ftp), so the inner T-PDU is a TCP data
-    # segment (PSH,ACK to port 80) rather than a placeholder ICMP echo.
-    base_inner_payload = (
-        IP(src="10.45.0.2", dst="8.8.8.8")
-        / TCP(sport=51820, dport=80, flags="PA", seq=1000, ack=1000)
-    )
     total_bytes = 0
     packet_count = 0
     llm_arrivals_count = 0  # all arrivals fetched from batch calls (incl. leftovers never consumed)
@@ -200,30 +293,61 @@ def create_web_browsing_stream(
             "raw_llm_compliant": pkt_json.get("raw_llm_compliant"),
             "session_consistent": pkt_json.get("session_consistent"),
         }
-        segments = []
-        remaining = pkt_json["payload_size"]
-        while remaining > 0:
-            seg = min(remaining, _MAX_SEGMENT_BYTES)
-            segments.append(seg)
-            remaining -= seg
-        batch = [
-            (
+        segments = _segment_burst_sizes(pkt_json["payload_size"])
+
+        # Each arrival is its own TCP connection — real web browsing opens
+        # many short-lived parallel connections rather than reusing one flow
+        # — so it gets a fresh ephemeral UE-side port and initial sequence
+        # number. The sequence number then advances across the burst's own
+        # MTU segments by each segment's actual TCP data length (segment
+        # size minus the fixed 40-byte IP/TCP header), so a packet analyzer
+        # sees a normal, internally-consistent TCP byte stream instead of a
+        # repeated static header. TTL is per-connection too: a real response
+        # from an internet server arrives already decremented by the path's
+        # hop count, and different servers/paths differ.
+        tcp_dport = random.randint(1024, 65535)
+        tcp_isn = random.randint(0, 0xFFFFFFFF)
+        tcp_ack = random.randint(400, 2000)  # plausible HTTP request size
+        inner_ttl = random.randint(52, 62)
+        byte_offset = 0
+        batch = []
+        for i, seg in enumerate(segments):
+            is_last = i == len(segments) - 1
+            # First segment carries the real burst-arrival gap; the rest are
+            # spaced by their own serialization time at N3 line rate plus
+            # jitter (see _N3_LINK_BPS), not a fixed constant.
+            if i == 0:
+                gap_ms = pkt_json["inter_arrival_ms"]
+            else:
+                gap_ms = max(
+                    _MIN_INTRA_BURST_GAP_MS,
+                    (seg * 8.0 / _N3_LINK_BPS) * 1000.0
+                    * random.uniform(*_INTRA_BURST_JITTER_RANGE),
+                )
+                if random.random() < _INTRA_BURST_PAUSE_PROB:
+                    gap_ms += random.uniform(*_INTRA_BURST_PAUSE_RANGE_MS)
+            batch.append((
                 seg,
-                pkt_json["inter_arrival_ms"] if i == 0 else _INTRA_BURST_GAP_MS,
+                gap_ms,
+                i == 0,
                 {
                     **segment_base,
                     "payload_size": seg,
-                    "inter_arrival_ms": pkt_json["inter_arrival_ms"] if i == 0 else _INTRA_BURST_GAP_MS,
+                    "inter_arrival_ms": gap_ms,
+                    "tcp_dport": tcp_dport,
+                    "tcp_seq": (tcp_isn + byte_offset) % 0x100000000,
+                    "tcp_ack": tcp_ack,
+                    "tcp_flags": "PA" if is_last else "A",
+                    "inner_ttl": inner_ttl,
                 },
-            )
-            for i, seg in enumerate(segments)
-        ]
+            ))
+            byte_offset += max(0, seg - 40)
 
-        for payload_size, inter_arrival_ms, meta in batch:
+        for payload_size, inter_arrival_ms, is_burst_start, meta in batch:
             seq += 1
 
             wire_packet, inter_arrival_ms, payload_size = _build_wire_packet(
-                ctx, meta, base_inner_payload, gnodeb_ip, upf_ip, seq, current_sim_time
+                ctx, meta, gnodeb_ip, upf_ip, seq, current_sim_time
             )
             packets.append(wire_packet)
             total_bytes += len(wire_packet)
@@ -236,6 +360,7 @@ def create_web_browsing_stream(
                 "seq": seq,
                 "payload_size_bytes": payload_size,
                 "inter_arrival_ms": inter_arrival_ms,
+                "is_burst_start": is_burst_start,
                 "sim_time_sec": round(sim_elapsed_sec, 3),
                 "raw_llm_compliant": meta.get("raw_llm_compliant"),
                 "session_consistent": meta.get("session_consistent"),
@@ -252,8 +377,18 @@ def create_web_browsing_stream(
 
     wrpcap(pcap_filename, packets)
     avg_payload = total_bytes / max(packet_count, 1)
-    avg_iat_ms = sum(r["inter_arrival_ms"] for r in telemetry_records) / max(len(telemetry_records), 1)
-    achieved_bps = (avg_payload * 8.0) / (avg_iat_ms / 1000.0) if avg_iat_ms > 0 else 0.0
+    # Burst-arrival inter-arrival time (comparable to Table II's T5QI): only
+    # each burst's first segment carries a real LLM-sampled gap. The rest are
+    # sub-millisecond intra-burst wire-segmentation gaps (serialization at
+    # _N3_LINK_BPS plus jitter/pauses) and would otherwise swamp the average.
+    burst_start_records = [r for r in telemetry_records if r["is_burst_start"]]
+    avg_iat_ms = (
+        sum(r["inter_arrival_ms"] for r in burst_start_records) / len(burst_start_records)
+        if burst_start_records else 0.0
+    )
+    # Direct throughput measure — not sensitive to segmentation granularity,
+    # unlike an average of per-segment size/gap ratios.
+    achieved_bps = (total_bytes * 8.0) / sim_elapsed_sec if sim_elapsed_sec > 0 else 0.0
 
     llm_judged = [r for r in telemetry_records if r["raw_llm_compliant"] is not None]
 
@@ -270,7 +405,7 @@ def create_web_browsing_stream(
         "packet_count": packet_count,
         "total_bytes": total_bytes,
         "avg_packet_size_bytes": round(avg_payload, 2),
-        "avg_inter_arrival_ms": round(avg_iat_ms, 2),
+        "avg_burst_inter_arrival_ms": round(avg_iat_ms, 2),
         "achieved_bitrate_bps": round(achieved_bps, 1),
         "table_ii_reference": {
             "r_bps": ref_stats["r_bps"],
@@ -313,7 +448,7 @@ def create_web_browsing_stream(
     print(f" Packets generated  : {packet_count}")
     print(f" Simulated duration : {sim_elapsed_sec:.1f} s ({sim_elapsed_sec/60:.2f} min)")
     print(f" Avg payload size   : {telemetry_data['avg_packet_size_bytes']} bytes")
-    print(f" Avg inter-arrival  : {telemetry_data['avg_inter_arrival_ms']} ms")
+    print(f" Avg burst IAT      : {telemetry_data['avg_burst_inter_arrival_ms']} ms (Table II T5QI={ref_stats['t_ms']:.0f} ms)")
     print(f" Achieved bitrate   : {achieved_bps/1e6:.2f} Mbps (Table II R5QI={ref_stats['r_bps']/1e6:.2f} Mbps)")
     if telemetry_data["llm_compliance_rate"] is not None:
         print(f" LLM compliance     : {telemetry_data['llm_compliance_rate']*100:.1f}% ({len(llm_judged)} sampled)")

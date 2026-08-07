@@ -7,7 +7,7 @@ and adds validation plus a small builder for the GTP-U header chain.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 from scapy.contrib.gtp import GTPPDUSessionContainer, GTP_U_Header
 from scapy.packet import Packet, Raw
@@ -189,35 +189,6 @@ def build_gtpu_packet_from_mutation(
     return build_gtpu_packet(payload=payload, **kwargs)
 
 
-def export_campaign_to_pcap(
-    mutations: List[Any],
-    output_filename: str = "llm_gtpu_campaign.pcap",
-    outer_ip_src: str = "192.168.100.10",
-    outer_ip_dst: str = "192.168.100.20",
-    inner_payload: Optional[Packet | bytes] = None,
-) -> str:
-    """Convert a sequence of mutation objects/dicts into a full wire-level PCAP trace."""
-    from scapy.layers.inet import IP, UDP, ICMP
-    from scapy.utils import wrpcap
-
-    if inner_payload is None:
-        inner_payload = IP(src="10.45.0.2", dst="8.8.8.8") / ICMP(type=8, code=0)
-
-    packets = []
-    for seq, mut in enumerate(mutations, start=1):
-        gtp_packet = build_gtpu_packet_from_mutation(mut, payload=inner_payload)
-        gtp_packet.seq = seq
-        wire_packet = (
-            IP(src=outer_ip_src, dst=outer_ip_dst)
-            / UDP(sport=GTPU_PORT, dport=GTPU_PORT)
-            / gtp_packet
-        )
-        packets.append(wire_packet)
-
-    wrpcap(output_filename, packets)
-    return output_filename
-
-
 __all__ = [
     "GTPUPDUSessionContainer",
     "GTP_U_Header",
@@ -225,6 +196,5 @@ __all__ = [
     "build_gtpu_packet",
     "build_gtpu_packet_from_mutation",
     "extract_container_kwargs",
-    "export_campaign_to_pcap",
 ]
 
