@@ -32,17 +32,9 @@ def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, up
     """Convert one LLM mutation dict into a timestamped Scapy wire packet.
 
     The T-PDU is a real inner IP/TCP frame matching the benign path's
-    web-browsing pattern, not raw filler bytes — otherwise Wireshark's GTP-U
-    dissector tries to parse the filler as IP and flags the packet as
-    malformed, which would make attack packets trivially distinguishable from
-    a structural artifact instead of the intended QFI/RQI/DSCP policy
-    violation. Per-packet randomized IP ID / ephemeral port / sequence number
-    and high-entropy payload all mirror the benign path for the same reason.
+    web-browsing pattern, not raw filler bytes.
     The outer IP's ToS carries the mutation's own (possibly violating)
-    outer_dscp, not the session's expected one — a DSCP-violation mutation
-    must actually carry the wrong DSCP on the wire, not just in telemetry.
-
-    ``direction`` selects the on-wire orientation:
+    outer_dscp, not the session's expected one.
 
     * ``"DL"`` — downlink G-PDU. Outer tunnel runs UPF -> gNB; inner T-PDU runs
       web server -> UE (matching the benign background). Models a

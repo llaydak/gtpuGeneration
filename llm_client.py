@@ -81,8 +81,13 @@ class LLMClient:
 
     def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT,
                  backend: str = "ollama", api_key: Optional[str] = None,
-                 max_output_tokens: Optional[int] = None):
+                 max_output_tokens: Optional[int] = None,
+                 seed: Optional[int] = None):
         self.backend = backend
+        # Base seed for reproducibility. Each generate() call uses seed+call_count,
+        # so the whole run is reproducible (same base -> same sequence) while each
+        # call still samples differently (no identical packets). None = provider default.
+        self.seed = seed
         # Ceiling applied to every generate() call's max_tokens, regardless of
         # backend; None (default) leaves each call site's own value untouched.
         self.max_output_tokens = max_output_tokens
@@ -127,6 +132,9 @@ class LLMClient:
                     kwargs["api_base"] = self.base_url
                 if self.api_key is not None:
                     kwargs["api_key"] = self.api_key
+                if self.seed is not None:
+                    # Per-call seed: reproducible run, but a different draw each call.
+                    kwargs["seed"] = self.seed + self.call_count
                 response = litellm_completion(**kwargs)
 
                 self.call_count += 1

@@ -27,16 +27,10 @@ TABLE_II_5QI_STATS = {\
     6: {"name": "Web Browsing", "r_bps": 5_000_000, "t_ms": 100.0, "p_bytes": 62_500, "d_ms": 280, "a": 0.641},
 }
 
-# Max inner (TCP) payload per wire packet. An LLM-generated burst's total
-# byte count is far larger than a real Ethernet-MTU packet, so it gets split
-# into segments this size.
+# Max inner (TCP) payload per wire packet. 
 _MAX_SEGMENT_BYTES = 1400
 
-# Segments of one burst arrive back-to-back at N3 line rate, so their spacing
-# is the packet's serialization time (bytes*8/link_rate), not a fixed constant.
-# A previously hardcoded 1.0ms gap put 98% of all inter-packet gaps at exactly
-# 1.000ms — physically impossible on a real link and a glaring synthetic
-# signature. 1 Gbps is a typical gNB-to-UPF N3 backhaul rate.
+#1 Gbps is a typical gNB-to-UPF N3 backhaul rate.
 _N3_LINK_BPS = 1_000_000_000
 # Multiplicative jitter on serialization delay, standing in for queueing /
 # scheduling variation so gaps aren't perfectly deterministic either. Widened
@@ -64,11 +58,6 @@ _LARGE_SEGMENT_RANGE = (1000, _MAX_SEGMENT_BYTES)
 
 
 def _segment_burst_sizes(total_bytes: int) -> List[int]:
-    """Slice a burst's total byte budget into a realistic bimodal mix of wire
-    segment sizes (large data segments plus a minority of small packets)
-    instead of a uniform train of MTU frames. The sum is preserved exactly, so
-    re-segmenting does not change the burst's contribution to the bitrate.
-    """
     sizes: List[int] = []
     remaining = total_bytes
     while remaining > 0:
@@ -140,29 +129,7 @@ def _build_wire_packet(
     seq: int,
     sim_time: float,
 ):
-    """Convert a single LLM packet dict into a timestamped Scapy wire packet.
-
-    This is a DOWNLINK G-PDU: the outer tunnel runs UPF -> gNB and the inner
-    T-PDU runs web server -> UE, which is what pdu_type=0 (DL PDU Session
-    Information, TS 38.415) actually means. Emitting DL-marked containers on
-    a gNB -> UPF / UE -> server packet, as this previously did, contradicts
-    the spec at both layers.
-
-    Builds the inner T-PDU as a TCP segment using this segment's own
-    tcp_dport/tcp_seq/tcp_ack/tcp_flags (see the per-burst TCP connection
-    profile assigned in create_web_browsing_stream) — each burst is its own
-    connection with its own ephemeral UE-side port and initial sequence
-    number, and sequence numbers advance across a burst's MTU segments, so a
-    packet analyzer sees distinct, internally-consistent TCP flows rather
-    than one static segment repeated on every wire packet. IP IDs are drawn
-    per packet (RFC 6864) instead of left at Scapy's constant default, and
-    the payload is high-entropy random bytes rather than repeated filler.
-    Pads the inner payload to match the LLM's requested payload_size and
-    advances the PCAP timestamp by inter_arrival_ms.
-
-    Returns:
-        (wire_packet, inter_arrival_ms, payload_size)
-    """
+    
     mutation = GTP_U_Mutation.from_json(ctx, pkt_json)
 
     payload_size = mutation.payload_size if mutation.payload_size else 250
@@ -219,12 +186,6 @@ def create_web_browsing_stream(
     max_output_tokens: Optional[int] = None,
     llm_batch_size: int = 200,
 ) -> tuple:
-    """Generate a 5QI 6 (Web Browsing) benign GTP-U stream for the given
-    duration, entirely LLM-driven.
-
-    Returns:
-        tuple: (path_to_pcap_file, path_to_telemetry_json)
-    """
     target_duration_sec = duration_minutes * 60.0
     ctx = _make_web_browsing_session()
     llm = LLMClient(model_name=model_name, backend=backend, max_output_tokens=max_output_tokens)

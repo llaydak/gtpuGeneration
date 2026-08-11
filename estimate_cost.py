@@ -3,25 +3,7 @@ committing to it, so a long-duration run doesn't burn tokens blindly.
 
 Cost is dominated by COMPLETION tokens, which scale with the number of LLM
 "arrivals" generated. The number of arrivals for a given simulated duration
-depends on the average burst inter-arrival time the model itself produces —
-which cannot be known a priori. So the accurate path is:
-
-  1. Run ONE cheap calibration batch (a single LLM call), e.g.:
-         ./upfvenv/bin/python generate_llm_pcap.py \
-             --backend openai --model gpt-5.6-luna \
-             --llm-batch-size 40 --max-packets 40
-     This makes exactly one API call (~1.4k prompt + ~40x completion tokens)
-     and writes a telemetry JSON with real token counts and the model's
-     avg burst inter-arrival time.
-
-  2. Extrapolate from it to your target duration:
-         ./upfvenv/bin/python estimate_cost.py \
-             --from-telemetry pcap_files/web_browsing_benign_*_telemetry.json \
-             --target-minutes 15 --price-in 5 --price-out 15
-
-Pricing (--price-in / --price-out, US$ per 1M tokens) is model-specific and
-must be supplied for gpt-5.6-luna — this script does not assume a rate. Omit
-them to get a token estimate only.
+depends on the average burst inter-arrival time the model itself produces. 
 """
 
 from __future__ import annotations

@@ -6,25 +6,11 @@ detectors over a generated pcap and compares what each catches against the
 ground-truth labels written alongside the pcap:
 
   1. STRUCTURAL IDS  — a standard, session-unaware parser (tshark / Wireshark's
-     own GTP-U dissector). A packet is "flagged" only if it is malformed at the
-     GTP-U layer: the PDU Session Container fails to dissect, or a field falls
-     outside its 3GPP range (QFI 0-63, PDU type 0/1). This is the grammar/syntax
-     layer. It deliberately ignores Wireshark's heuristic upper-layer dissectors
-     (LISP/TLS/...) misfiring on the random inner T-PDU payload, since that is
-     opaque user data a UPF forwards without inspection — not a GTP-U defect.
+     own GTP-U dissector). This is the grammar/syntax layer.
 
   2. SEMANTIC IDS    — a session-aware policy checker that re-derives each
      packet's QFI / RQI / outer-DSCP and direction from the wire and tests them
-     against the session's QER/FAR state (active QFI set, reflective-QoS
-     allow-list, expected DSCP). This is the same read-only logic the generator
-     records as ground truth, re-implemented here directly off the pcap so the
-     proof does not merely trust the generator's labels.
-
-The headline result is the DETECTION GAP: attack packets that the structural
-IDS accepts as perfectly valid but the semantic IDS catches. A large gap with a
-low semantic false-positive rate is the evidence that "schema-valid yet
-semantically inconsistent" is a real, exploitable class the syntax layer cannot
-see — the core claim of the study.
+     against the session's QER/FAR state.
 
 Usage:
     ./upfvenv/bin/python detection_gap_report.py pcap_files/injected_attack_stream_*.pcap
@@ -75,18 +61,6 @@ class PacketVerdict:
 
 
 def _tshark_dissect(pcap_path: str) -> List[Dict]:
-    """Independent per-frame GTP-U dissection via tshark (Wireshark's own
-    parser), in frame order. Returns one dict per frame:
-    {parsed, qfi, pdu_type, rqi, dscp}.
-
-    This scopes the STRUCTURAL check to the GTP-U tunnelling layer and its PDU
-    Session Container — the bytes a UPF/GTP parser actually validates.
-    Deliberately does NOT use Wireshark whole-frame expert-info, because
-    tshark's heuristic upper-layer dissectors (LISP, TLS, ...) misfire on the
-    random inner T-PDU payload and raise "malformed" errors that have nothing
-    to do with GTP-U well-formedness. The inner T-PDU is opaque user data the
-    UPF forwards without inspection, so those artifacts are out of scope.
-    """
     tshark = shutil.which("tshark")
     if not tshark:
         raise SystemExit("tshark not found in PATH — it is required as the independent GTP-U parser.")
@@ -124,11 +98,6 @@ def _tshark_dissect(pcap_path: str) -> List[Dict]:
 
 
 def _structural_malformed(row: Dict) -> bool:
-    """STRUCTURAL IDS: is this packet malformed at the GTP-U layer? True only
-    if the PDU Session Container did not dissect, or a field is out of its
-    3GPP-defined range (QFI 0-63, PDU type 0/1). An unauthorized-but-in-range
-    QFI is NOT structurally malformed — that is a semantic violation.
-    """
     if not row["parsed"]:
         return True
     if row["qfi"] is None or not (0 <= row["qfi"] <= 63):
@@ -140,13 +109,6 @@ def _structural_malformed(row: Dict) -> bool:
 
 def _semantic_check(pdu_type: int, qfi: int, rqi: int, dscp: int,
                     policy: SessionPolicy) -> tuple:
-    """Direction-aware session-policy check. Mirrors
-    LLMClient._evaluate_semantic_precision so the proof and the generator agree
-    on what "semantically anomalous" means, but is computed straight off the
-    wire here.
-
-    Returns (is_anomalous, reasons).
-    """
     reasons: List[str] = []
     violates_qfi = qfi not in policy.active_qfis
     if pdu_type == 1:
