@@ -2,102 +2,89 @@
 
 import json
 import os
-import re
 from typing import Optional, Dict, List, Any
+
+import numpy as np
 
 from gtpu_scapy import (
     SELF_HOSTED_MODELS_URL,
     MODEL_VARIANT,
-    KNOWN_EXTENSION_TYPES,
     FIELD_BOUNDS,
 )
 from session_context import SessionContext
 from packet_model import GTP_U_Mutation
+import reference_models
 
 try:
-    # pyrefly: ignore [missing-import]
+    import litellm
     from litellm import completion as litellm_completion
+    litellm.suppress_debug_info = True
 except Exception:
     litellm_completion = None
 
-# 3GPP TS 23.501 Table 5.7.4-1 (Standardized 5QI to QoS characteristics
-# mapping). Resource Type / Priority Level / Packet Delay Budget / Packet
-# Error Rate are the spec's own numbers, not a third-party empirical paper —
-# reproduced here from memory of the published table; cross-check against
-# your own copy of TS 23.501 before citing these in written work.
+# 3GPP TS 23.501 Table 5.7.4-1 (Standardized 5QI to QoS characteristics mapping),
+# pre-rendered in the spec's own Resource Type / Priority Level / Packet Delay
+# Budget / Packet Error Rate order. Only 5QI 6 is listed: the benign session maps
+# QFI 1 -> 5QI 6 and no other QoS class is generated.
 _5QI_3GPP_REFERENCE = {
-    2: {
-        "resource_type": "GBR",
-        "priority_level": 40,
-        "pdb_ms": 150,
-        "per": "10^-3",
-        "example_services": "Conversational Video (Live Streaming)",
-    },
-    3: {
-        "resource_type": "GBR",
-        "priority_level": 30,
-        "pdb_ms": 50,
-        "per": "10^-3",
-        "example_services": "Real-Time Gaming, V2X messages",
-    },
-    4: {
-        "resource_type": "GBR",
-        "priority_level": 50,
-        "pdb_ms": 300,
-        "per": "10^-6",
-        "example_services": "Non-Conversational Video (Buffered Streaming)",
-    },
-    6: {
-        "resource_type": "Non-GBR",
-        "priority_level": 60,
-        "pdb_ms": 300,
-        "per": "10^-6",
-        "example_services": "TCP-based apps (www, email, chat, ftp, p2p file sharing, progressive video) — i.e. web browsing, NOT voice/video",
-    },
-    8: {
-        "resource_type": "Non-GBR",
-        "priority_level": 80,
-        "pdb_ms": 300,
-        "per": "10^-6",
-        "example_services": "Video (Buffered Streaming), TCP-based apps",
-    },
+    6: "Non-GBR, Priority 60, Packet Delay Budget 300ms, Packet Error Rate 10^-6 — "
+       "TCP-based apps (www, email, chat, ftp, p2p file sharing, progressive video) — "
+       "i.e. web browsing, NOT voice/video",
 }
 
 
 def _qos_line(five_qi: int) -> str:
-    qos = _5QI_3GPP_REFERENCE.get(five_qi)
-    if not qos:
-        return f"  5QI {five_qi}: unlisted — use your own TS 23.501 knowledge"
-    return (
-        f"  5QI {five_qi}: {qos['resource_type']}, Priority {qos['priority_level']}, "
-        f"Packet Delay Budget {qos['pdb_ms']}ms, Packet Error Rate {qos['per']} — "
-        f"{qos['example_services']}"
+    spec = _5QI_3GPP_REFERENCE.get(five_qi, "unlisted — use your own TS 23.501 knowledge")
+    return f"  5QI {five_qi}: {spec}"
+
+
+# Model-authored fields only — never echo our own evaluation back into the prompt.
+_ECHO_FIELDS = ("extension_headers", "outer_dscp", "reasoning", "payload_size", "inter_arrival_ms")
+
+
+_CAMPAIGN_PLAN_SCHEMA = """
+  "campaign_size": <int>,
+  "injection_fraction": <float 0.0-1.0>,"""
+
+
+def _campaign_plan_block(actor: str) -> str:
+    return f"""
+CAMPAIGN PLAN (first packet — you set the campaign's shape too). Think as {actor}.
+Decide: a quick probe or a sustained attempt, and whether to strike immediately or
+blend in first. Vary both across runs. Add to your JSON:
+- "campaign_size": int, total packets in this campaign (including this one)
+- "injection_fraction": float 0.0-1.0, where in the background timeline it starts
+"""
+
+
+def _previous_context(previous_mutations: Optional[List[Dict]]) -> str:
+    if not previous_mutations:
+        return ""
+    shown = "\n".join(
+        f"Previous packet #{i+1}: {json.dumps({k: m[k] for k in _ECHO_FIELDS if k in m}, sort_keys=True)}"
+        for i, m in enumerate(previous_mutations[-2:])
     )
+    return "\n\nPrevious packets in this campaign (use them as dependency context):\n" + shown
 
 
 class LLMClient:
-    """Wrapper for LLM usage via LiteLLM, backed by either a local Ollama
-    server (default, offline) or the OpenAI API (backend="openai")."""
 
     def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT,
                  backend: str = "ollama", api_key: Optional[str] = None,
                  max_output_tokens: Optional[int] = None,
-                 seed: Optional[int] = None):
-        self.backend = backend
-        # Base seed for reproducibility. Each generate() call uses seed+call_count,
-        # so the whole run is reproducible (same base -> same sequence) while each
-        # call still samples differently (no identical packets). None = provider default.
-        self.seed = seed
-        # Ceiling applied to every generate() call's max_tokens, regardless of
-        # backend; None (default) leaves each call site's own value untouched.
+                 few_shot_seed: Optional[int] = None):
+
         self.max_output_tokens = max_output_tokens
         self.call_count = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
-        # Set by generate() after each call so callers can distinguish "the
-        # model wrote invalid JSON" from "the response was cut off at
-        # max_tokens" — the latter needs a smaller request, not just a retry.
         self.last_finish_reason: Optional[str] = None
+        # Picks which real reference flows each batch shows the model, redrawn
+        # per batch (reference_models.sample_example_flows). Pinning this replays
+        # that sequence -- useful to hold the few-shot draw fixed while comparing
+        # prompt variants. It does NOT make a run reproducible end to end: the
+        # provider's own sampling is deliberately left unpinned.
+        self._few_shot_rng = np.random.default_rng(few_shot_seed)
 
         if backend == "openai":
             self.base_url = None  # api_base is for the self-hosted Ollama server only
@@ -132,9 +119,6 @@ class LLMClient:
                     kwargs["api_base"] = self.base_url
                 if self.api_key is not None:
                     kwargs["api_key"] = self.api_key
-                if self.seed is not None:
-                    # Per-call seed: reproducible run, but a different draw each call.
-                    kwargs["seed"] = self.seed + self.call_count
                 response = litellm_completion(**kwargs)
 
                 self.call_count += 1
@@ -164,23 +148,7 @@ class LLMClient:
 
     def _evaluate_semantic_precision(self, headers: List[Dict], dscp: int, ctx: SessionContext,
                                      direction: str = "DL") -> Dict[str, Any]:
-        """Deterministically check if the generated packet violates session policy bounds.
-
-        ``direction`` selects which enforcement point the anomaly targets and
-        therefore which violation dimensions actually count:
-
-        * ``"UL"`` (uplink, pdu_type=1) — the UPF performs QoS-flow-ID
-          verification (TS 29.244 PDR/QER matching, TS 23.501 §5.7): a QFI not
-          in the session's authorized set is the exact case the UPF is
-          supposed to reject, so ``violates_active_qfis`` is the *UPF-enforced*
-          anomaly. RQI/PPI do not exist on the uplink container, and outer DSCP
-          is a transport marking the UPF does not semantically verify — those
-          are recorded but do NOT drive ``is_semantically_anomalous`` here.
-        * ``"DL"`` (downlink, pdu_type=0) — QFI/RQI/DSCP are set by the UPF and
-          consumed by the gNB/UE, so all three inconsistency dimensions count
-          (this models a compromised-UPF egress rather than a UPF the packet
-          is verified against).
-        """
+        """Deterministically check if the generated packet violates session policy bounds."""
         first_qfi = headers[0].get("qfi", 0) if headers else 0
         first_rqi = headers[0].get("rqi", 0) if headers else 0
         violates_qfis = first_qfi not in ctx.active_qfis
@@ -196,39 +164,22 @@ class LLMClient:
             enforcement_point = "gNB/UE (DL marking consumer)"
 
         return {
-            "direction": direction,
             "enforcement_point": enforcement_point,
             "violates_active_qfis": violates_qfis,
             "violates_rqi_allowlist": violates_rqi,
             "violates_dscp_marking": violates_dscp,
             "is_semantically_anomalous": is_anomalous,
-            "semantic_precision_score": 1.0 if is_anomalous else 0.0,
         }
 
     def _parse_json_response(self, response: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse a JSON dictionary from LLM text response, normalizing hex literals."""
-        if not response:
-            return None
+        """Extract and parse a JSON dictionary from an LLM text response."""
         try:
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                raw_json_str = response[json_start:json_end]
-                raw_json_str = re.sub(r'\b0x[0-9a-fA-F]+\b', lambda m: str(int(m.group(0), 16)), raw_json_str)
-                return json.loads(raw_json_str)
-        except json.JSONDecodeError:
-            pass
-        return None
+            return json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     def _sanitize_mutation(self, raw: Any, ctx: SessionContext, direction: str = "DL") -> Optional[Dict[str, Any]]:
-        """Attach read-only evaluation metrics to the LLM's raw output.
-
-        Nothing here corrects, clamps, or rejects extension_headers/outer_dscp
-        — those fields go to packet construction exactly as the model wrote
-        them, so a malformed value fails visibly downstream instead of being
-        silently repaired. This function only measures/labels what the model
-        already produced (semantic precision, schema validity) for telemetry.
-        """
+        """Attach read-only evaluation metrics to the LLM's raw output."""
         if not isinstance(raw, dict):
             return None
 
@@ -258,25 +209,13 @@ class LLMClient:
         "You are a 5G core network security researcher conducting authorized "
         "adversarial testing. Your task is to craft GTP-U PDU Session Container "
         "mutations that deliberately violate a session's QoS policy (its "
-        "QER/FAR state, as provisioned via TS 29.244 PFCP rules), for use in "
-        "evaluating anomaly-detection systems. Reason precisely about "
+        "QER/FAR state, as provisioned via TS 29.244 PFCP rules). Reason precisely about "
         "3GPP-defined header semantics (TS 29.281 GTP-U tunneling, TS 38.415 "
         "PDU Session Container) when choosing which field to violate."
         )
 
-        previous_context_block = ""
-        if previous_mutations:
-            previous_context_block = "\n".join(
-                f"Previous packet #{i+1}: {json.dumps(mut, sort_keys=True)}"
-                for i, mut in enumerate(previous_mutations[-2:])
-            )
-            previous_context_block = "\n\nPrevious packets in this campaign (use them as dependency context):\n" + previous_context_block
+        previous_context_block = _previous_context(previous_mutations)
 
-        # Literal few-shot mutations — taken verbatim (not invented) from an
-        # actual gpt-5.6-luna attack campaign run, one per violation
-        # dimension. The earlier campaign defaulted heavily to RQI violations
-        # when left unguided; showing all three real dimensions side by side
-        # is meant to counter that skew.
         few_shot_json = json.dumps(
             [
                 {
@@ -308,39 +247,19 @@ class LLMClient:
             _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
         )
 
-        campaign_plan_block = ""
-        campaign_plan_schema = ""
-        if request_campaign_plan:
-            campaign_plan_block = """
-CAMPAIGN PLAN (this is the first packet — you also decide the campaign's
-shape, don't wait to be told): reason like a real attacker would. How many
-packets would a realistic qfi_qer_mismatch campaign consist of here — a
-quick probe or a sustained attempt? At what point in an ongoing benign
-traffic flow would a compromised session realistically start misbehaving —
-immediately, or only after blending in for a while? There is no fixed
-answer; pick values that fit your own reasoning about this specific session,
-and vary them from what you might have picked in other runs. Include in
-your JSON:
-- "campaign_size": int, total packets for this whole campaign (this one included)
-- "injection_fraction": float 0.0-1.0, how far into the background traffic
-  timeline this campaign should begin (0.0 = start, 1.0 = end)
-"""
-            campaign_plan_schema = """
-  "campaign_size": <int>,
-  "injection_fraction": <float 0.0-1.0>,"""
+        campaign_plan_block = _campaign_plan_block("a real attacker") if request_campaign_plan else ""
+        campaign_plan_schema = _CAMPAIGN_PLAN_SCHEMA if request_campaign_plan else ""
 
         prompt = f"""Session state (evaluate mutation AGAINST this session state):
 {ctx.to_prompt_block()}
 {previous_context_block}
 
-Known 3GPP extension header type codes:
-{json.dumps(KNOWN_EXTENSION_TYPES, indent=2)}
-
-3GPP TS 23.501 Table 5.7.4-1 QoS characteristics, to ground your payload_size/
-inter_arrival_ms estimate:
+QoS grounding (TS 23.501) for payload_size (bytes) / inter_arrival_ms — tighter
+Packet Delay Budget -> shorter inter-arrival; GBR -> more sustained than Non-GBR:
 {qfi_5qi_reference}
 
-Task: Generate mutation whose QFI, RQI, or outer DSCP violates the session state rules above (a qfi_qer_mismatch).
+Task: Generate a mutation using extension header type 133 (PDU Session Container)
+whose QFI, RQI, or outer DSCP violates the session state rules above (a qfi_qer_mismatch).
 {campaign_plan_block}
 
 NOTE: RQI and PPI are only meaningful when pdu_type=0 (downlink). If you set rqi or ppi to a nonzero value, you MUST also set pdu_type=0, or those fields will be silently dropped from the wire packet.
@@ -352,39 +271,32 @@ If previous packets are shown above, do NOT repeat the same one of these
 three dimensions again — rotate to a different one, and also vary header
 order/flag state within it.
 
-REAL FEW-SHOT EXAMPLE — 3 mutations taken verbatim from an actual attack
-campaign run, one per violation dimension above (qfi/rqi/dscp values are
-from a different session, don't copy them — only the dimension and
-plausibility of payload_size/inter_arrival_ms is the point):
+Real examples, one per dimension (from another session — reuse the shape and the
+plausible payload_size/inter_arrival_ms, not the exact qfi/rqi/dscp values):
 {few_shot_json}
 
-Traffic Modeling: output realistic `payload_size` (int, bytes) and
-`inter_arrival_ms` (float, milliseconds), derived from the QoS
-characteristics above (tighter Packet Delay Budget implies shorter
-inter-arrival; GBR implies more sustained bitrate than Non-GBR) — not
-generic values.
-
-RESPOND ONLY WITH VALID JSON (no markdown formatting):
+Respond with JSON only:
 {{
   "extension_headers": [
-    {{"type": <int e.g. 133>, "pdu_type": <0 or 1>, "qfi": <int {FIELD_BOUNDS['qfi']['min']}-{FIELD_BOUNDS['qfi']['max']}>, "rqi": <int {FIELD_BOUNDS['rqi']['min']}-{FIELD_BOUNDS['rqi']['max']}>, "ppi": <int {FIELD_BOUNDS['ppi']['min']}-{FIELD_BOUNDS['ppi']['max']}>}}
+    {{"type": 133, "pdu_type": <0 or 1>, "qfi": <int {FIELD_BOUNDS['qfi']['min']}-{FIELD_BOUNDS['qfi']['max']}>, "rqi": <int {FIELD_BOUNDS['rqi']['min']}-{FIELD_BOUNDS['rqi']['max']}>, "ppi": <int {FIELD_BOUNDS['ppi']['min']}-{FIELD_BOUNDS['ppi']['max']}>}}
   ],
   "outer_dscp": <int {FIELD_BOUNDS['outer_dscp']['min']}-{FIELD_BOUNDS['outer_dscp']['max']}>,{campaign_plan_schema}
   "reasoning": "<1 concise sentence explaining the policy violation>",
   "payload_size": <int>,
   "inter_arrival_ms": <float>
 }}
-
-CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex notation like 0x00 or 0x85.
 """
-        for attempt in range(1, max_retries + 1):
-            response = self.generate(prompt, system, max_tokens=2000)
-            parsed = self._parse_json_response(response)
-            if parsed:
-                return self._sanitize_mutation(parsed, ctx)
-            print(f"[WARN] Failed to generate/parse mutation JSON from {self.model_name} on attempt {attempt}/{max_retries}")
+        return self._retry_mutation(system, prompt, ctx, direction="DL", max_retries=max_retries)
 
-        print(f"[ERROR] Failed to generate valid mutation packet after {max_retries} attempts.")
+    def _retry_mutation(self, system: str, prompt: str, ctx: SessionContext,
+                        direction: str, max_retries: int) -> Optional[Dict]:
+        for attempt in range(1, max_retries + 1):
+            parsed = self._parse_json_response(self.generate(prompt, system, max_tokens=2000))
+            if parsed:
+                return self._sanitize_mutation(parsed, ctx, direction=direction)
+            print(f"[WARN] Failed to generate/parse {direction} mutation JSON from "
+                  f"{self.model_name} on attempt {attempt}/{max_retries}")
+        print(f"[ERROR] Failed to generate valid {direction} mutation after {max_retries} attempts.")
         return None
 
     def _generate_ul_mutation(self, ctx: SessionContext,
@@ -393,14 +305,7 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
                               max_retries: int = 3) -> Optional[Dict]:
         """Uplink (pdu_type=1) qfi_qer_mismatch mutation.
 
-        The UL PDU Session Container carries a QFI only — RQI and PPI are
-        downlink-only fields and do not exist here. The semantic violation is
-        therefore a QFI outside the session's authorized set: exactly the
-        condition the UPF's uplink QoS-flow-ID verification (TS 29.244 PDR/QER
-        matching, TS 23.501 §5.7) is required to detect and reject. This is the
-        one violation dimension the UPF itself enforces, which is what makes it
-        the load-bearing case for a UPF-targeted study.
-        """
+        The UL PDU Session Container carries a QFI only"""
         system = (
             "You are a 5G core network security researcher conducting authorized "
             "adversarial testing against a UPF. You craft UPLINK GTP-U PDU Session "
@@ -412,43 +317,23 @@ CRITICAL: Use ONLY base-10 decimal integers (e.g. 0, 1, 133). DO NOT use hex not
             "gNB would mark to slip a flow past the UPF's enforcement."
         )
 
-        previous_context_block = ""
-        if previous_mutations:
-            previous_context_block = "\n".join(
-                f"Previous packet #{i+1}: {json.dumps(mut, sort_keys=True)}"
-                for i, mut in enumerate(previous_mutations[-2:])
-            )
-            previous_context_block = "\n\nPrevious packets in this campaign (use them as dependency context):\n" + previous_context_block
+        previous_context_block = _previous_context(previous_mutations)
 
         qfi_5qi_reference = "\n".join(
             _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
         )
 
-        campaign_plan_block = ""
-        campaign_plan_schema = ""
-        if request_campaign_plan:
-            campaign_plan_block = """
-CAMPAIGN PLAN (this is the first packet — you also decide the campaign's
-shape): reason like a real attacker probing UPF uplink enforcement. How many
-packets would a realistic unauthorized-QFI uplink campaign consist of here —
-a quick probe or a sustained attempt? At what point in an ongoing benign
-flow would a compromised UE realistically start marking unauthorized QFIs?
-Pick values that fit your own reasoning about this specific session, and vary
-them across runs. Include in your JSON:
-- "campaign_size": int, total packets for this whole campaign (this one included)
-- "injection_fraction": float 0.0-1.0, how far into the background traffic
-  timeline this campaign should begin (0.0 = start, 1.0 = end)
-"""
-            campaign_plan_schema = """
-  "campaign_size": <int>,
-  "injection_fraction": <float 0.0-1.0>,"""
+        campaign_plan_block = (
+            _campaign_plan_block("a compromised UE probing UPF uplink enforcement")
+            if request_campaign_plan else ""
+        )
+        campaign_plan_schema = _CAMPAIGN_PLAN_SCHEMA if request_campaign_plan else ""
 
         prompt = f"""Session state (evaluate mutation AGAINST this session state):
 {ctx.to_prompt_block()}
 {previous_context_block}
 
-3GPP TS 23.501 Table 5.7.4-1 QoS characteristics, to ground your payload_size/
-inter_arrival_ms estimate:
+QoS grounding (TS 23.501) for payload_size (bytes) / inter_arrival_ms:
 {qfi_5qi_reference}
 
 Task: Generate an UPLINK mutation (pdu_type=1) whose QFI is NOT in this
@@ -462,11 +347,7 @@ CAMPAIGN DIVERSITY REQUIREMENT: if previous packets are shown above, pick a
 DIFFERENT unauthorized QFI than they used (still outside {ctx.active_qfis}),
 and vary payload_size/inter_arrival_ms — don't repeat one value.
 
-Traffic Modeling: output realistic `payload_size` (int, bytes) and
-`inter_arrival_ms` (float, milliseconds) grounded in the QoS characteristics
-above — not generic values.
-
-RESPOND ONLY WITH VALID JSON (no markdown formatting):
+Respond with JSON only:
 {{
   "extension_headers": [
     {{"type": 133, "pdu_type": 1, "qfi": <int {FIELD_BOUNDS['qfi']['min']}-{FIELD_BOUNDS['qfi']['max']} and NOT in {ctx.active_qfis}>, "rqi": 0, "ppi": 0}}
@@ -476,35 +357,19 @@ RESPOND ONLY WITH VALID JSON (no markdown formatting):
   "payload_size": <int>,
   "inter_arrival_ms": <float>
 }}
-
-CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 or 0x85.
 """
-        for attempt in range(1, max_retries + 1):
-            response = self.generate(prompt, system, max_tokens=2000)
-            parsed = self._parse_json_response(response)
-            if parsed:
-                return self._sanitize_mutation(parsed, ctx, direction="UL")
-            print(f"[WARN] Failed to generate/parse UL mutation JSON from {self.model_name} on attempt {attempt}/{max_retries}")
-
-        print(f"[ERROR] Failed to generate valid UL mutation packet after {max_retries} attempts.")
-        return None
+        return self._retry_mutation(system, prompt, ctx, direction="UL", max_retries=max_retries)
 
     def generate_burst(self, ctx: SessionContext, burst_size: Optional[int] = None,
-                       direction: str = "DL",
-                       max_retries_per_pkt: int = 3, fallback_burst_size: int = 10) -> List[Dict]:
+                       duration_sec: Optional[float] = None, direction: str = "DL",
+                       max_retries_per_pkt: int = 3, fallback_burst_size: int = 10,
+                       duration_max_packets: int = 500) -> List[Dict]:
         """Generate a multi-packet qfi_qer_mismatch campaign.
 
-        ``direction`` is "DL" (downlink, pdu_type=0, the compromised-UPF-egress
-        model) or "UL" (uplink, pdu_type=1, the case the UPF's own QoS-flow-ID
-        verification is meant to reject — see _evaluate_semantic_precision).
-
-        If burst_size is None (default), the model itself decides the
-        campaign's size and where in the background traffic it should be
-        injected — the first packet's response carries "campaign_size" /
-        "injection_fraction" (see generate_mutation's campaign-plan prompt),
-        so every run can land at a different point with a different length
-        instead of a fixed spot. Pass an explicit burst_size to override this
-        and pin it to a fixed count (e.g. for a reproducible test run).
+        Length precedence: duration_sec (keep generating until the campaign's own
+        inter_arrival_ms fills that many seconds, capped at duration_max_packets
+        so a small IAT can't run the API cost away), else burst_size packets,
+        else the model's own campaign_size. Each packet is one API call.
         """
         burst: List[Dict] = []
         previous_mutations: List[Dict] = []
@@ -519,6 +384,31 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
             return []
         previous_mutations.append(first)
         burst.append(first)
+
+        if duration_sec is not None:
+            target_ms = duration_sec * 1000.0
+            elapsed_ms = first.get("inter_arrival_ms") or 20.0
+            consecutive_fail = 0
+            while elapsed_ms < target_ms and len(burst) < duration_max_packets:
+                mut = self.generate_mutation(ctx, previous_mutations=previous_mutations,
+                                             direction=direction, max_retries=max_retries_per_pkt)
+                if mut:
+                    consecutive_fail = 0
+                    previous_mutations.append(mut)
+                    burst.append(mut)
+                    elapsed_ms += mut.get("inter_arrival_ms") or 20.0
+                else:
+                    consecutive_fail += 1
+                    print(f"[WARN] Attack slot {len(burst)+1} failed after {max_retries_per_pkt} retries.")
+                    if consecutive_fail >= 3:
+                        print("[ERROR] 3 consecutive failures — stopping the campaign early.")
+                        break
+            if len(burst) >= duration_max_packets and elapsed_ms < target_ms:
+                print(f"[WARN] Duration campaign hit the {duration_max_packets}-packet safety cap at "
+                      f"~{elapsed_ms/1000:.1f}s of {duration_sec:.0f}s — raise duration_max_packets to fill it.")
+            print(f"[TELEMETRY] Duration campaign: {len(burst)} packets (= {len(burst)} API calls) "
+                  f"covering ~{elapsed_ms/1000:.1f}s of a {duration_sec:.0f}s window.")
+            return burst
 
         if burst_size is None:
             planned = first.get("campaign_size")
@@ -543,12 +433,6 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
 
     def _sanitize_benign(self, raw: Any, ctx: SessionContext) -> Optional[Dict[str, Any]]:
         """Attach read-only evaluation metrics to the LLM's raw benign output.
-
-        Nothing here corrects, clamps, or rejects extension_headers/outer_dscp
-        — those fields go to packet construction exactly as the model wrote
-        them, so a malformed value fails visibly downstream instead of being
-        silently repaired. This function only measures/labels what the model
-        already produced (session-consistency, schema validity) for telemetry.
         """
         if not isinstance(raw, dict):
             return None
@@ -560,23 +444,22 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
         qfi = first.get("qfi")
         rqi = first.get("rqi", 0)
 
-        qfi_consistent = qfi in ctx.active_qfis
-        rqi_consistent = (rqi == 0 or qfi in ctx.reflective_qos_enabled_qfis)
-        dscp_consistent = (dscp == ctx.dscp_marking)
-        no_exotic_headers = (
-            isinstance(ext_headers, list)
-            and all(isinstance(h, dict) and h.get("type") == 133 for h in ext_headers)
-        )
-        session_consistent = qfi_consistent and rqi_consistent and dscp_consistent and no_exotic_headers
+        policy_violations = [name for name, ok in (
+            ("qfi_not_in_active_set", qfi in ctx.active_qfis),
+            ("rqi_outside_allowlist", rqi == 0 or qfi in ctx.reflective_qos_enabled_qfis),
+            ("dscp_mismatch", dscp == ctx.dscp_marking),
+            ("exotic_extension_header", isinstance(ext_headers, list) and all(
+                isinstance(h, dict) and h.get("type") == 133 for h in ext_headers)),
+        ) if not ok]
 
         reasoning = str(raw.get("reasoning", "")) or "Normal traffic consistent with session QoS policy."
 
         try:
-            target_bitrate_bps = float(raw["target_bitrate_bps"])
+            payload_size = int(round(float(raw["payload_size"])))
         except (KeyError, TypeError, ValueError) as e:
-            raise ValueError(f"LLM returned non-numeric or missing target_bitrate_bps: {raw.get('target_bitrate_bps')!r}") from e
-        if target_bitrate_bps <= 0:
-            raise ValueError(f"LLM returned non-positive target_bitrate_bps: {target_bitrate_bps}")
+            raise ValueError(f"LLM returned non-numeric or missing payload_size: {raw.get('payload_size')!r}") from e
+        if payload_size <= 0:
+            raise ValueError(f"LLM returned non-positive payload_size: {payload_size}")
 
         try:
             inter_arrival_ms = float(raw["inter_arrival_ms"])
@@ -585,9 +468,12 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
         if inter_arrival_ms <= 0:
             raise ValueError(f"LLM returned non-positive inter_arrival_ms: {inter_arrival_ms}")
 
-        # This is a burst's TOTAL byte count (the caller splits it into
-        # MTU-sized wire segments), not one packet's size.
-        payload_size = round(target_bitrate_bps * (inter_arrival_ms / 1000.0) / 8.0)
+        try:
+            request_bytes = int(raw["request_bytes"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"LLM returned non-numeric or missing request_bytes: {raw.get('request_bytes')!r}") from e
+        if request_bytes <= 0:
+            raise ValueError(f"LLM returned non-positive request_bytes: {request_bytes}")
 
         mutation_dict = {
             "teid": ctx.teid,
@@ -595,31 +481,17 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
             "outer_dscp": dscp,
             "traffic_class": "benign",
             "anomaly_type": "benign",  # Explicit sentinel label to prevent mislabeling in GTP_U_Mutation.from_json
-            "raw_llm_compliant": session_consistent,  # Surfaced as explicit evaluation metric
-            "session_consistent": session_consistent,
-            "consistency_detail": {
-                "qfi_in_active_set": qfi_consistent,
-                "rqi_matches_allowlist": rqi_consistent,
-                "dscp_matches_session": dscp_consistent,
-                "no_exotic_headers": no_exotic_headers,
-            },
+            "policy_violations": policy_violations,
             "reasoning": reasoning,
             "payload_size": payload_size,
             "inter_arrival_ms": inter_arrival_ms,
-            "target_bitrate_bps": target_bitrate_bps,
+            "request_bytes": request_bytes,
         }
         mutation_dict["raw_schema_valid"] = GTP_U_Mutation.from_json(ctx, mutation_dict).is_valid_schema()
         return mutation_dict
 
     def generate_benign_batch(self, ctx: SessionContext, batch_size: int = 50,
                                max_retries: int = 3) -> List[Dict]:
-        """Generate benign baseline packets in a SINGLE LLM
-        call. (roughly 150-250 tokens per packet in gpt-5.6-luna).
-
-        Traffic timing/bitrate is grounded in each QFI's 3GPP TS 23.501
-        Table 5.7.4-1 QoS characteristics (Resource Type, Priority Level,
-        Packet Delay Budget, Packet Error Rate).
-        """
 
         system = (
                 "You are a senior 5G core network traffic engineer specializing in "
@@ -634,86 +506,82 @@ CRITICAL: Use ONLY base-10 decimal integers. DO NOT use hex notation like 0x00 o
             _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
         )
 
-        few_shot_packets = [
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 770688, "inter_arrival_ms": 378.5},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 3470943, "inter_arrival_ms": 125.8},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 4242769, "inter_arrival_ms": 98.7},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 81445596, "inter_arrival_ms": 7.4},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 6554792, "inter_arrival_ms": 75.3},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 5360527, "inter_arrival_ms": 94.2},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 12664613, "inter_arrival_ms": 61.0},
-            {"qfi": 6, "rqi": 0, "dscp": 0, "target_bitrate_bps": 44091814, "inter_arrival_ms": 14.6},
-        ]
-        few_shot_json = json.dumps(
-            [
-                {
-                    "extension_headers": [
-                        {"type": 133, "pdu_type": 0, "qfi": p["qfi"], "rqi": p["rqi"], "ppi": 0}
-                    ],
-                    "outer_dscp": p["dscp"],
-                    "target_bitrate_bps": p["target_bitrate_bps"],
-                    "inter_arrival_ms": p["inter_arrival_ms"],
-                }
-                for p in few_shot_packets
-            ],
-            indent=2,
+        examples = reference_models.sample_example_flows(8, self._few_shot_rng)
+        if examples:
+            few_shot_block = "\n".join(
+                f"- payload {e['total_bytes']:,} B, request {e['request_bytes']:,} B"
+                for e in examples
+            )
+        else:
+            few_shot_block = "(reference flows unavailable — rely on the shape above)"
+
+        # Rounded on purpose: exact byte counts in the prompt get copied
+        # verbatim (a run reproduced the exact median and max several times each,
+        # inflating the tail). Round figures give the shape without an exact
+        # value to latch onto.
+        def _round_bytes(x: int) -> str:
+            if x < 2_000:
+                return f"~{round(x, -2):,} B"
+            if x < 1_000_000:
+                return f"~{x / 1000:.0f} KB"
+            return f"~{x / 1_000_000:.0f} MB"
+
+        pct = reference_models.flow_size_percentiles()
+        shape_line = (
+            f"Real payload_size distribution to reproduce: median {_round_bytes(pct['p50'])}, "
+            f"~90% below {_round_bytes(pct['p90'])}, ~99% below {_round_bytes(pct['p99'])}, "
+            f"with rare outliers up to a few MB."
+            if pct else
+            "payload_size is heavy-tailed: median a few hundred bytes, rare outliers up "
+            "to several MB."
         )
 
         def _build_prompt(n: int) -> str:
-            return f"""Session state (every packet MUST be consistent with this):
-- TEID: {ctx.teid}, Direction: DL (pdu_type=0)
-- Active QFIs: {ctx.active_qfis}
-- QFI -> 5QI: {ctx.qfi_to_5qi}
-- Reflective QoS (RQI=1) allowed for QFIs: {ctx.reflective_qos_enabled_qfis}
+            return f"""Session (every flow MUST match this):
+- Active QFIs: {ctx.active_qfis} (use only these; pdu_type 0, ppi 0)
 - outer_dscp: {ctx.dscp_marking}
+- RQI=1 allowed only for QFIs {ctx.reflective_qos_enabled_qfis} (else rqi 0)
 
-3GPP TS 23.501 Table 5.7.4-1 QoS characteristics, to identify each QFI's
-application and derive realistic traffic behavior:
+QoS grounding (TS 23.501):
 {qfi_5qi_reference}
 
-RULES (every packet):
-1. extension_headers: exactly one entry, type 133.
-2. qfi: from {ctx.active_qfis}. pdu_type: 0. ppi: 0. outer_dscp: {ctx.dscp_marking}.
-3. rqi: 1 only if qfi is in {ctx.reflective_qos_enabled_qfis}, else 0.
-4. Output `target_bitrate_bps` (bits/sec) and `inter_arrival_ms` (ms) per the
-   QFI's 5QI application — don't compute payload size, it's derived downstream.
-   Derive these from the QoS characteristics above (not a fixed external
-   benchmark): a tighter Packet Delay Budget implies shorter, more
-   time-sensitive inter-arrival; GBR implies a more sustained/guaranteed
-   bitrate than Non-GBR. Use your own domain knowledge of what that resource
-   type and example service typically looks like on the wire.
+Produce {n} benign downlink web-browsing FLOWS. Each flow is one TCP connection.
+You set three numbers; the generator turns them into wire packets:
+- payload_size (int bytes): total downlink bytes. THIS distribution is scored.
+- inter_arrival_ms (float): gap since the previous flow (shorter for a tighter
+  Packet Delay Budget).
+- request_bytes (int): the uplink request that triggered the download.
 
-REAL FEW-SHOT EXAMPLE — 8 packets taken verbatim from an actual captured
-traffic burst (5QI 6, Non-GBR web browsing). This is not a target mean to
-match — it illustrates the SHAPE of realistic variance: a burst that arrives
-sooner than the previous one also tends to carry more bytes, so its
-instantaneous bitrate can spike far above a typical value while
-inter_arrival_ms drops to a fraction of it. Reproduce this same magnitude of
-swing for your own QFI/5QI, scaled to what you derive above — the
-qfi/rqi/dscp values below are from a different session, don't copy them:
-{few_shot_json}
+{shape_line}
+HALF of all flows are under ~900 B, and many are TINY — 50 to 500 bytes, single
+small packets (keepalives, ACKs, small responses). The same small sizes recur
+constantly: real traffic is highly repetitive at the small end, so reusing small
+values is correct and expected. Only a minority reach tens or hundreds of KB, and
+rarely one runs to MB scale. Do NOT round every flow up into the KB range — emit
+many sub-500-byte flows. The examples are a representative sample (mostly small,
+as the real traffic is), not a ceiling:
+{few_shot_block}
 
-Generate EXACTLY {n} such packets.
-
-RESPOND ONLY WITH VALID JSON: {{"packets": [...]}} with EXACTLY {n}
-objects using these exact field names — extension_headers, outer_dscp,
-target_bitrate_bps, inter_arrival_ms. No markdown, no placeholder strings;
-target_bitrate_bps and inter_arrival_ms must be real numbers.
+Return ONLY JSON {{"flows": [ ... {n} objects ... ]}}, each object:
+{{"extension_headers": [{{"type": 133, "pdu_type": 0, "qfi": <int>, "rqi": <int>, "ppi": 0}}],
+  "outer_dscp": {ctx.dscp_marking}, "payload_size": <int>, "inter_arrival_ms": <float>,
+  "request_bytes": <int>}}
+No markdown; payload_size, inter_arrival_ms and request_bytes must be real numbers.
 """
 
-        # If the caller set an explicit ceiling, respect it as a hard cap
-        # (generate() would otherwise clamp a smaller heuristic value down
-        # and the ceiling would never bind). Otherwise size it off however
-        # many packets are actually being requested this attempt.
         current_batch_size = batch_size
 
         for attempt in range(1, max_retries + 1):
-            requested_max_tokens = self.max_output_tokens or max(2000, current_batch_size * 300)
+            requested_max_tokens = self.max_output_tokens or max(2000, current_batch_size * 150)
             prompt = _build_prompt(current_batch_size)
             response = self.generate(prompt, system, max_tokens=requested_max_tokens)
             truncated = (self.last_finish_reason == "length")
             parsed = self._parse_json_response(response)
-            raw_packets = parsed.get("packets") if isinstance(parsed, dict) else None
+            # Accept either key: the prompt asks for "flows", but tolerate
+            # "packets" so a key-name slip does not throw the whole batch away.
+            raw_packets = None
+            if isinstance(parsed, dict):
+                raw_packets = parsed.get("flows") or parsed.get("packets")
             if isinstance(raw_packets, list) and raw_packets:
                 sanitized: List[Dict] = []
                 for i, raw_pkt in enumerate(raw_packets):

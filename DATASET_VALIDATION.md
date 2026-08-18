@@ -363,26 +363,7 @@ fields via tshark (not the Scapy library that built the packets), removing
 circularity in the "schema-valid" claim.
 **Status:** Verified.
 
-## 23. Wire packet sizes are not a single MTU spike
-
-**Claim:** The benign size distribution resembles real downlink web browsing (a
-bimodal mix of large data segments and smaller packets), not a spike at MTU.
-**Finding (2026-08-07):** In a calibration run, 1,825 of 1,865 wire packets were
-exactly 1,444 B — every burst sliced into a uniform MTU train. A lone MTU spike
-is trivially separable by any size-feature IDS, undermining the baseline's use
-for measuring false-positive rates.
-**Fix:** `_segment_burst_sizes` re-slices each burst into a bimodal mix
-(`_SMALL_SEGMENT_FRACTION` from `_SMALL_SEGMENT_RANGE` 40–400 B, the rest from
-`_LARGE_SEGMENT_RANGE` 1000–1400 B). The sum is preserved exactly, so
-re-segmentation doesn't change the burst's bitrate contribution.
-**Reverification:** on a 40-arrival mock run the wire trace went from ~1
-distinct size to 768 (mean ~990 B, min 84 / max 1444), achieved bitrate still
-tracking the input mean.
-**Caveat:** this is a *modeled* marginal size mix chosen to break the MTU
-spike, not one derived from a real capture's TCP dynamics — no
-congestion-control segment pattern, no ACK stream, no per-object structure
-(see #20). Realistic in its size distribution, not its causal process.
-**Status:** Fixed.Saldırının iki kanıtlanmış zararı var
+##
 
 
 ## 24. Live free5GC UPF does not police the uplink QFI; forwarding costs UPF CPU (empirical)

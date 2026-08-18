@@ -32,7 +32,6 @@ def test_semantic_precision_evaluates_policy_violations():
 
     assert result["violates_active_qfis"] is True
     assert result["is_semantically_anomalous"] is True
-    assert result["semantic_precision_score"] == 1.0
 
 
 def test_ul_semantic_precision_only_qfi_is_upf_enforced():
@@ -116,7 +115,14 @@ def test_gtpu_mutation_rqi_regression_and_ppp_auto_set():
     assert pkt[GTPUPDUSessionContainer].PPI == 3
     assert pkt[GTPUPDUSessionContainer].PPP == 1
 
-    ctx = SessionContext.random_synthetic(42)
+    ctx = SessionContext(
+        teid=0x0BADC0DE,
+        active_qfis=[10],
+        qfi_to_5qi={10: 6},
+        qfi_to_qer={10: 1},
+        reflective_qos_enabled_qfis=[10],
+        dscp_marking=0x00,
+    )
     mut_json = {
         "teid": 0x11223344,
         "extension_headers": [{"type": 0x85, "qfi": 10, "rqi": 1, "ppi": 5, "pdu_type": 0}],

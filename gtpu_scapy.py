@@ -14,7 +14,6 @@ from scapy.packet import Packet, Raw
 
 
 PDU_SESSION_CONTAINER_TYPE = 0x85
-GTPU_PORT = 2152
 
 SELF_HOSTED_MODELS_URL = "http://192.168.100.38:11434"
 MODEL_VARIANT = "mistral:7b"
@@ -99,11 +98,18 @@ def build_gtpu_packet(
         normalized_fields["PPP"] = 1
 
     container = GTPUPDUSessionContainer(type=pdu_type, **normalized_fields)
+    # S=0: sequence numbers are optional (TS 29.281) and a typical free5GC /
+    # Open5GS N3 does not set them. E=1 still forces the 4-byte optional block
+    # (seq/npdu/next-ext) onto the wire, so the extension header serialises
+    # correctly; the seq field is simply carried as 0 and ignored, matching the
+    # testbed. Pass sequence_number>0 (and it will still serialise) only if a
+    # caller deliberately wants S=1 behaviour.
+    seq_flag = 1 if sequence_number else 0
     packet = GTP_U_Header(
         version=1,
         PT=1,
         E=1,
-        S=1,
+        S=seq_flag,
         PN=0,
         gtp_type=255,
         teid=teid,

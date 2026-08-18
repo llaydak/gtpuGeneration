@@ -92,6 +92,7 @@ def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, up
 def create_injected_attack_stream(
     background_duration_minutes: float = 1.0,
     burst_size: Optional[int] = None,
+    attack_duration_minutes: Optional[float] = None,
     injection_fraction: Optional[float] = None,
     direction: str = "DL",
     output_dir: str = "pcap_files",
@@ -102,15 +103,17 @@ def create_injected_attack_stream(
     max_output_tokens: Optional[int] = None,
     llm_batch_size: int = 200,
     background_max_packets: Optional[int] = None,
+    attack_max_packets: int = 500,
 ) -> tuple:
     """Generate a benign 5QI 6 background stream via LLM batch calls and
     inject one LLM-generated qfi_qer_mismatch attack campaign into it.
 
-    burst_size/injection_fraction default to None, meaning the model itself
-    decides the campaign's length and where in the traffic it lands (see
-    LLMClient.generate_burst) — every run can land at a different point with
-    a different size instead of a fixed spot. Pass explicit values to pin
-    them for a reproducible run.
+    Attack length is set by (in precedence): attack_duration_minutes (keep
+    generating until that many minutes of the campaign's own timing is covered,
+    capped at attack_max_packets since each attack packet is one API call),
+    else burst_size packets, else — if both are None — the model's own
+    campaign_size. injection_fraction=None likewise lets the model choose where
+    in the background timeline to strike. Pass explicit values to pin a run.
 
     Both the background and the attack packets belong to the SAME session
     (same TEID/QFI) — the attack represents a compromised/malicious flow
@@ -119,10 +122,17 @@ def create_injected_attack_stream(
     Returns:
         tuple: (path_to_pcap_file, path_to_telemetry_json)
     """
+    if burst_size is not None and attack_duration_minutes is not None:
+        raise ValueError("Pass either burst_size or attack_duration_minutes, not both.")
+    attack_duration_sec = attack_duration_minutes * 60.0 if attack_duration_minutes is not None else None
     ctx = _make_web_browsing_session()
     llm = LLMClient(model_name=model_name, backend=backend, max_output_tokens=max_output_tokens)
 
-    print(f"GTP-U Benign + Injected Attack Stream (background={background_duration_minutes}min, burst_size={burst_size or 'model-decided'})")
+    if attack_duration_minutes is not None:
+        attack_len_desc = f"duration={attack_duration_minutes}min (cap {attack_max_packets} pkts)"
+    else:
+        attack_len_desc = f"burst_size={burst_size or 'model-decided'}"
+    print(f"GTP-U Benign + Injected Attack Stream (background={background_duration_minutes}min, {attack_len_desc})")
     print("=" * 70)
 
     benign_pcap, _ = create_web_browsing_stream(
@@ -139,7 +149,10 @@ def create_injected_attack_stream(
     print(ctx.to_prompt_block())
     print()
 
-    mutations = llm.generate_burst(ctx, burst_size=burst_size, direction=direction, max_retries_per_pkt=3)
+    mutations = llm.generate_burst(
+        ctx, burst_size=burst_size, duration_sec=attack_duration_sec,
+        direction=direction, max_retries_per_pkt=3, duration_max_packets=attack_max_packets,
+    )
     if not mutations:
         raise RuntimeError("LLM failed to generate any attack packets for this campaign.")
 
@@ -173,7 +186,12 @@ def create_injected_attack_stream(
     json_filename = pcap_filename.replace(".pcap", "_telemetry.json")
     wrpcap(pcap_filename, combined)
 
-    requested_burst_size = burst_size if burst_size is not None else mutations[0].get("campaign_size", len(mutations))
+    if attack_duration_minutes is not None:
+        requested_burst_size = f"duration:{attack_duration_minutes}min"
+    elif burst_size is not None:
+        requested_burst_size = burst_size
+    else:
+        requested_burst_size = mutations[0].get("campaign_size", len(mutations))
     policy_violation_hits = sum(1 for m in mutations if m["semantic_precision"]["is_semantically_anomalous"])
     ground_truth = [
         {"seq": i + 1, "time": float(p.time), "is_attack": id(p) in attack_ids}
@@ -190,6 +208,7 @@ def create_injected_attack_stream(
         "background_packet_count": len(benign_packets),
         "attack_burst_size_requested": requested_burst_size,
         "attack_burst_size_generated": len(mutations),
+        "attack_duration_minutes": attack_duration_minutes,
         "injection_fraction": injection_fraction,
         "injection_index": injection_index,
         "injection_time_sec": injection_time,
@@ -236,7 +255,9 @@ if __name__ == "__main__":
         description="Generate a benign GTP-U stream with one LLM-driven qfi_qer_mismatch attack campaign injected into it."
     )
     parser.add_argument("--background-duration", type=float, default=1.0, help="Background traffic duration in minutes (default: 1.0).")
-    parser.add_argument("--burst-size", type=int, default=None, help="Packets in the injected attack campaign. Default: unset — the model decides the campaign size itself.")
+    parser.add_argument("--burst-size", type=int, default=None, help="Packets in the injected attack campaign. Default: unset — the model decides the campaign size itself. Mutually exclusive with --attack-duration.")
+    parser.add_argument("--attack-duration", type=float, default=None, help="Attack length in MINUTES instead of a packet count: keep generating attack packets until this much of the campaign's own timing is covered. Mutually exclusive with --burst-size.")
+    parser.add_argument("--attack-max-packets", type=int, default=500, help="Safety cap on attack packets in --attack-duration mode (each is one API call), so a small model-chosen inter_arrival_ms can't run the cost away (default: 500).")
     parser.add_argument("--injection-fraction", type=float, default=None, help="Where in the background stream to inject the attack, 0-1. Default: unset — the model decides where in the traffic to strike.")
     parser.add_argument("--direction", choices=["DL", "UL"], default="DL",
                         help="Attack orientation. 'UL' (uplink, pdu_type=1) is the QFI the UPF's own QoS-flow-ID verification is meant to reject; 'DL' (downlink, pdu_type=0, default) models a compromised-UPF egress.")
@@ -251,6 +272,7 @@ if __name__ == "__main__":
     create_injected_attack_stream(
         background_duration_minutes=args.background_duration,
         burst_size=args.burst_size,
+        attack_duration_minutes=args.attack_duration,
         injection_fraction=args.injection_fraction,
         direction=args.direction,
         output_dir=args.output_dir,
@@ -258,5 +280,6 @@ if __name__ == "__main__":
         backend=args.backend,
         max_output_tokens=args.max_output_tokens,
         llm_batch_size=args.llm_batch_size,
+        attack_max_packets=args.attack_max_packets,
         background_max_packets=args.background_max_packets,
     )
