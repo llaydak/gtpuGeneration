@@ -5,15 +5,15 @@ import os
 from typing import Optional, Dict, List, Any
 
 import numpy as np
+from dotenv import load_dotenv
 
-from gtpu_scapy import (
-    SELF_HOSTED_MODELS_URL,
-    MODEL_VARIANT,
-    FIELD_BOUNDS,
-)
+from gtpu import FIELD_BOUNDS, GTP_U_Mutation
 from session_context import SessionContext
-from packet_model import GTP_U_Mutation
 import reference_models
+
+load_dotenv()
+SELF_HOSTED_MODELS_URL = os.environ["SELF_HOSTED_MODELS_URL"]
+MODEL_VARIANT = os.environ["MODEL_VARIANT"]
 
 try:
     import litellm
@@ -36,6 +36,26 @@ _5QI_3GPP_REFERENCE = {
 def _qos_line(five_qi: int) -> str:
     spec = _5QI_3GPP_REFERENCE.get(five_qi, "unlisted — use your own TS 23.501 knowledge")
     return f"  5QI {five_qi}: {spec}"
+
+
+def _qos_reference_block(ctx: SessionContext) -> str:
+    """TS 23.501 QoS grounding lines for the session's 5QIs, for the prompt."""
+    return "\n".join(_qos_line(q) for q in sorted(set(ctx.qfi_to_5qi.values())))
+
+
+def _arrival_target_line() -> str:
+    """5G-NIDD-grounded flow inter-arrival target (ms) for the prompt. A
+    compromised UE's flows arrive like any UE's, so benign and attack share it —
+    keeping the attack purely a QoS-marking anomaly, not a rate/volume spike."""
+    a = reference_models.arrival_gap_percentiles()
+    if not a:
+        return ("inter_arrival_ms is MILLISECONDS; consecutive flows are seconds apart "
+                "(~5000 ms median), so output values in the THOUSANDS (e.g. 5000), not single digits.")
+    return (f"inter_arrival_ms is in MILLISECONDS (1 s = 1000 ms). Real 5G-NIDD distribution: "
+            f"median ~{a['p50']:,} ms (~{a['p50']/1000:.0f} s), ~90% below ~{a['p90']:,} ms "
+            f"(~{a['p90']/1000:.0f} s), heavy-tailed. Flows are SECONDS apart (a UE's think-time), "
+            f"so inter_arrival_ms is in the THOUSANDS — e.g. 5000, 12000, 800. Do NOT output values "
+            f"under ~500 for most flows.")
 
 
 # Model-authored fields only — never echo our own evaluation back into the prompt.
@@ -71,20 +91,16 @@ class LLMClient:
 
     def __init__(self, base_url=SELF_HOSTED_MODELS_URL, model_name=MODEL_VARIANT,
                  backend: str = "ollama", api_key: Optional[str] = None,
-                 max_output_tokens: Optional[int] = None,
-                 few_shot_seed: Optional[int] = None):
+                 max_output_tokens: Optional[int] = None):
 
         self.max_output_tokens = max_output_tokens
         self.call_count = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.last_finish_reason: Optional[str] = None
-        # Picks which real reference flows each batch shows the model, redrawn
-        # per batch (reference_models.sample_example_flows). Pinning this replays
-        # that sequence -- useful to hold the few-shot draw fixed while comparing
-        # prompt variants. It does NOT make a run reproducible end to end: the
-        # provider's own sampling is deliberately left unpinned.
-        self._few_shot_rng = np.random.default_rng(few_shot_seed)
+        # Redrawn per batch (reference_models.sample_example_flows) so no few-shot
+        # set becomes a ceiling; unseeded, like the provider's own sampling.
+        self._few_shot_rng = np.random.default_rng()
 
         if backend == "openai":
             self.base_url = None  # api_base is for the self-hosted Ollama server only
@@ -223,29 +239,27 @@ class LLMClient:
                     "outer_dscp": 0,
                     "reasoning": "QFI 7 is not provisioned for this session's active QFI set [6].",
                     "payload_size": 1200,
-                    "inter_arrival_ms": 20.0,
+                    "inter_arrival_ms": 4200.0,
                 },
                 {
                     "extension_headers": [{"type": 133, "pdu_type": 0, "qfi": 6, "rqi": 1, "ppi": 0}],
                     "outer_dscp": 0,
                     "reasoning": "RQI=1 on QFI 6 is outside the reflective-QoS allow-list for this session.",
                     "payload_size": 1200,
-                    "inter_arrival_ms": 20.0,
+                    "inter_arrival_ms": 8100.0,
                 },
                 {
                     "extension_headers": [{"type": 133, "pdu_type": 0, "qfi": 6, "rqi": 0, "ppi": 0}],
                     "outer_dscp": 10,
                     "reasoning": "Outer DSCP 10 conflicts with the session's expected DSCP 0x00.",
                     "payload_size": 1180,
-                    "inter_arrival_ms": 20.0,
+                    "inter_arrival_ms": 3500.0,
                 },
             ],
             indent=2,
         )
 
-        qfi_5qi_reference = "\n".join(
-            _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
-        )
+        qfi_5qi_reference = _qos_reference_block(ctx)
 
         campaign_plan_block = _campaign_plan_block("a real attacker") if request_campaign_plan else ""
         campaign_plan_schema = _CAMPAIGN_PLAN_SCHEMA if request_campaign_plan else ""
@@ -254,9 +268,13 @@ class LLMClient:
 {ctx.to_prompt_block()}
 {previous_context_block}
 
-QoS grounding (TS 23.501) for payload_size (bytes) / inter_arrival_ms — tighter
-Packet Delay Budget -> shorter inter-arrival; GBR -> more sustained than Non-GBR:
+QoS grounding (TS 23.501) for payload_size (bytes):
 {qfi_5qi_reference}
+
+{_arrival_target_line()}
+The compromised UE behaves like a normal UE in TIMING — only its QoS markings are
+malicious. Do NOT burst; space flows seconds apart like benign traffic so the anomaly
+is purely semantic, not a rate spike.
 
 Task: Generate a mutation using extension header type 133 (PDU Session Container)
 whose QFI, RQI, or outer DSCP violates the session state rules above (a qfi_qer_mismatch).
@@ -319,9 +337,7 @@ Respond with JSON only:
 
         previous_context_block = _previous_context(previous_mutations)
 
-        qfi_5qi_reference = "\n".join(
-            _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
-        )
+        qfi_5qi_reference = _qos_reference_block(ctx)
 
         campaign_plan_block = (
             _campaign_plan_block("a compromised UE probing UPF uplink enforcement")
@@ -333,8 +349,13 @@ Respond with JSON only:
 {ctx.to_prompt_block()}
 {previous_context_block}
 
-QoS grounding (TS 23.501) for payload_size (bytes) / inter_arrival_ms:
+QoS grounding (TS 23.501) for payload_size (bytes):
 {qfi_5qi_reference}
+
+{_arrival_target_line()}
+The compromised UE behaves like a normal UE in TIMING — only its QFI is unauthorized.
+Do NOT burst; space flows seconds apart like benign traffic so the anomaly is purely
+semantic, not a rate spike.
 
 Task: Generate an UPLINK mutation (pdu_type=1) whose QFI is NOT in this
 session's active QFI set {ctx.active_qfis} — the case the UPF's uplink
@@ -362,7 +383,7 @@ Respond with JSON only:
 
     def generate_burst(self, ctx: SessionContext, burst_size: Optional[int] = None,
                        duration_sec: Optional[float] = None, direction: str = "DL",
-                       max_retries_per_pkt: int = 3, fallback_burst_size: int = 10,
+                       max_retries_per_pkt: int = 3,
                        duration_max_packets: int = 500) -> List[Dict]:
         """Generate a multi-packet qfi_qer_mismatch campaign.
 
@@ -387,7 +408,7 @@ Respond with JSON only:
 
         if duration_sec is not None:
             target_ms = duration_sec * 1000.0
-            elapsed_ms = first.get("inter_arrival_ms") or 20.0
+            elapsed_ms = first.get("inter_arrival_ms") or 5000.0
             consecutive_fail = 0
             while elapsed_ms < target_ms and len(burst) < duration_max_packets:
                 mut = self.generate_mutation(ctx, previous_mutations=previous_mutations,
@@ -396,7 +417,7 @@ Respond with JSON only:
                     consecutive_fail = 0
                     previous_mutations.append(mut)
                     burst.append(mut)
-                    elapsed_ms += mut.get("inter_arrival_ms") or 20.0
+                    elapsed_ms += mut.get("inter_arrival_ms") or 5000.0
                 else:
                     consecutive_fail += 1
                     print(f"[WARN] Attack slot {len(burst)+1} failed after {max_retries_per_pkt} retries.")
@@ -415,8 +436,8 @@ Respond with JSON only:
             if isinstance(planned, int) and planned >= 1:
                 burst_size = planned
             else:
-                print(f"[WARN] Model didn't provide a usable campaign_size ({planned!r}); falling back to {fallback_burst_size}.")
-                burst_size = fallback_burst_size
+                print(f"[WARN] Model didn't provide a usable campaign_size ({planned!r}); falling back to 10.")
+                burst_size = 10
 
         for slot in range(2, burst_size + 1):
             mut = self.generate_mutation(ctx, previous_mutations=previous_mutations,
@@ -502,9 +523,7 @@ Respond with JSON only:
                 "anomaly or policy violation."
         )
 
-        qfi_5qi_reference = "\n".join(
-            _qos_line(five_qi) for five_qi in sorted(set(ctx.qfi_to_5qi.values()))
-        )
+        qfi_5qi_reference = _qos_reference_block(ctx)
 
         examples = reference_models.sample_example_flows(8, self._few_shot_rng)
         if examples:
@@ -515,10 +534,8 @@ Respond with JSON only:
         else:
             few_shot_block = "(reference flows unavailable — rely on the shape above)"
 
-        # Rounded on purpose: exact byte counts in the prompt get copied
-        # verbatim (a run reproduced the exact median and max several times each,
-        # inflating the tail). Round figures give the shape without an exact
-        # value to latch onto.
+     
+        # Round figures give the shape without an exact value to latch onto.
         def _round_bytes(x: int) -> str:
             if x < 2_000:
                 return f"~{round(x, -2):,} B"
@@ -536,6 +553,8 @@ Respond with JSON only:
             "to several MB."
         )
 
+        arrival_line = _arrival_target_line()
+
         def _build_prompt(n: int) -> str:
             return f"""Session (every flow MUST match this):
 - Active QFIs: {ctx.active_qfis} (use only these; pdu_type 0, ppi 0)
@@ -548,11 +567,12 @@ QoS grounding (TS 23.501):
 Produce {n} benign downlink web-browsing FLOWS. Each flow is one TCP connection.
 You set three numbers; the generator turns them into wire packets:
 - payload_size (int bytes): total downlink bytes. THIS distribution is scored.
-- inter_arrival_ms (float): gap since the previous flow (shorter for a tighter
-  Packet Delay Budget).
+- inter_arrival_ms (float): gap since the previous flow STARTED, in MILLISECONDS
+  (flows are seconds apart, so this is thousands of ms — see target below). Also scored.
 - request_bytes (int): the uplink request that triggered the download.
 
 {shape_line}
+{arrival_line}
 HALF of all flows are under ~900 B, and many are TINY — 50 to 500 bytes, single
 small packets (keepalives, ACKs, small responses). The same small sizes recur
 constantly: real traffic is highly repetitive at the small end, so reusing small
@@ -577,8 +597,6 @@ No markdown; payload_size, inter_arrival_ms and request_bytes must be real numbe
             response = self.generate(prompt, system, max_tokens=requested_max_tokens)
             truncated = (self.last_finish_reason == "length")
             parsed = self._parse_json_response(response)
-            # Accept either key: the prompt asks for "flows", but tolerate
-            # "packets" so a key-name slip does not throw the whole batch away.
             raw_packets = None
             if isinstance(parsed, dict):
                 raw_packets = parsed.get("flows") or parsed.get("packets")
@@ -595,10 +613,6 @@ No markdown; payload_size, inter_arrival_ms and request_bytes must be real numbe
                     return sanitized
             print(f"[WARN] Failed to generate/parse batch JSON from {self.model_name} on attempt {attempt}/{max_retries}")
             if truncated and current_batch_size > 1:
-                # The response was cut off at max_tokens, not merely
-                # malformed — retrying with the same request size would
-                # likely truncate again. Shrink what we ask for so the next
-                # attempt actually has a chance to complete.
                 current_batch_size = max(1, current_batch_size // 2)
                 print(f"[WARN] Response was truncated (finish_reason=length) — retrying with a smaller batch_size={current_batch_size}.")
 

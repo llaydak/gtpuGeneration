@@ -2,14 +2,7 @@
 
 Tracks every claim this project makes about its generated GTP-U benign+attack
 dataset, how it was verified, and its status. The dataset is intended for
-publication, so each claim must be independently checkable rather than taken
-on faith. Methodology loosely follows "Datasheets for Datasets" (Gebru et
-al., 2018, arXiv:1803.09010) — cite in the paper if referencing this process.
-
-Status values: **Verified** (checked, holds), **Fixed** (was wrong, now
-corrected and reverified), **Open** (known gap, not yet resolved).
-
----
+publication, so each claim must be independently checkable. 
 
 ## 1. GTP-U wire format is 3GPP-compliant (TS 29.281 / TS 38.415)
 
@@ -159,7 +152,7 @@ comparison baseline, and its comparison data already exists (#9). It is
 recoverable from git history if a rigorous distribution benchmark is needed
 later. `TABLE_II_5QI_STATS` and the `achieved_bitrate` vs. `table_ii_reference`
 telemetry comparison were kept as a static reference, not a sampling path.
-**Status:** Implemented — test suite (6/6) and both CLIs reverified.
+**Status:** Implemented — test suite (7/7) and both CLIs reverified.
 
 ## 13. No public dataset provides ground truth for QFI/extension-header realism
 
@@ -200,8 +193,8 @@ segments (see #5, #23), and every non-first segment carries only a tiny
 intra-burst gap (see #18), not a real sampled arrival gap. These sub-ms gaps
 vastly outnumbered the real ones in the average — an observed run reported
 3.22 ms despite the burst-arrival process itself averaging ~101 ms, on T5QI.
-**Fix:** Each telemetry record is now tagged `is_burst_start` (true only for a
-burst's first wire segment), and the reported `avg_burst_inter_arrival_ms` is
+**Fix:** Each telemetry record is now tagged `is_flow_start` (true only for a
+flow's first wire segment), and the reported `avg_flow_inter_arrival_ms` is
 computed over those records only, making it directly comparable to T5QI.
 `achieved_bitrate_bps` was also switched from an average-of-ratios to a direct
 `total_bytes*8/simulated_duration_seconds` measure, insensitive to segmentation
@@ -209,10 +202,10 @@ granularity.
 **Note:** T5QI is a *sanity comparator*, not a target the LLM is prompted to
 hit — timing is grounded in TS 23.501 (#10), so agreement is a plausibility
 check, not a fitted result (cf. the same caveat for bitrate in #9).
-**Status:** Fixed — reverified against a prior run: 413 burst-start records,
-avg ≈101.2 ms vs. T5QI=100 ms. (That run predated the field, so burst-starts
+**Status:** Fixed — reverified against a prior run: 413 flow-start records,
+avg ≈101.2 ms vs. T5QI=100 ms. (That run predated the field, so flow-starts
 were reconstructed via the then-valid `inter_arrival_ms != 1.0` proxy; the
-proxy no longer holds since #18, so reuse the `is_burst_start` field directly.)
+proxy no longer holds since #18, so reuse the `is_flow_start` field directly.)
 
 ## 15. Inner TCP header is not a static, repeated artifact
 
@@ -298,18 +291,14 @@ violations; all are traffic-modeling simplifications.
 
 - **No TCP connection lifecycle.** No handshake, teardown, pure-ACKs, or
   retransmissions; flows appear mid-stream ("Follow TCP Stream" is one-sided).
-- **Single server, single UE, no DNS.** Real browsing resolves names and fans
-  out across many servers/connections; this models one server IP and one UE.
-- **Benign background is downlink-only.** A real capture point would also see
-  the uplink request/ACK stream. (Attack packets can be uplink — see #21 — but
-  the benign background is DL.)
-- **Single fixed TEID (`0xDEADBEEF`).** Real N3 allocates a TEID per direction;
-  a magic constant is both simplified and an obvious synthetic marker.
-- **GTP-U S flag set on every G-PDU.** Sequence numbers are optional per
-  TS 29.281; typical free5GC/Open5GS N3 runs `S=0`. Not a violation, but
-  atypical, and adds 4 bytes per packet.
-- **QFI numerically equals 5QI (both 6).** Permitted, but QFI is an arbitrary
-  0–63 identifier that need not align with the 5QI in a real deployment.
+- **Single server, no DNS.** Real browsing resolves names and fans out across
+  many servers/connections; this models one server IP. Multiple UEs are now
+  supported (`--num-ues`, distinct TEIDs/IPs per UE), but each still talks to
+  the one server.
+- **Static synthetic endpoints.** TEIDs are fixed per direction/UE
+  (`0x000000C9` DL / `0x000000CA` UL, spaced by UE index) rather than
+  dynamically allocated per session; inner UE/server IPs are constants. Real
+  N3 allocates TEIDs at session setup.
 
 **Status:** Open — disclose in any publication.
 
@@ -363,8 +352,17 @@ fields via tshark (not the Scapy library that built the packets), removing
 circularity in the "schema-valid" claim.
 **Status:** Verified.
 
-##
+## 23. Wire-segment sizes are a plausible mix, not an all-MTU spike
 
+**Claim:** Splitting each LLM flow total into wire segments should yield a
+realistic size distribution (a mix of MTU-filling and small control/ACK-sized
+frames), not a degenerate spike at the MTU.
+**Implementation:** `_fragment_flow` / `_split_mtu` (`generate_llm_pcap.py`) cap
+segments at `_MTU` (1500) with a `_MIN_PKT` (40 B header) floor, and a fraction
+`_SMALL_SEGMENT_PROB` (0.30) of intra-flow segments are drawn small so the wire
+size mix is bimodal. This is a modelling choice, not a measurement.
+**Status:** Implemented — referenced by #5 (arrival-vs-segment distinction) and
+#14 (per-segment vs per-flow timing).
 
 ## 24. Live free5GC UPF does not police the uplink QFI; forwarding costs UPF CPU (empirical)
 

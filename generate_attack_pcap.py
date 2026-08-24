@@ -1,33 +1,36 @@
-"""Generate a benign GTP-U baseline stream with one LLM-driven qfi_qer_mismatch
-attack campaign injected — mixed benign + attack traffic as it would actually occur on the wire.
+"""Generate a benign GTP-U baseline stream with LLM-driven qfi_qer_mismatch
+attack campaign injected.
 
 Each attack packet is individually schema-valid but carries a QFI/RQI/DSCP
 combination that violates the session's QER/FAR policy.
 """
 
 import json
-import os
 import random
 from datetime import datetime
 from typing import Dict, Optional
 
-from scapy.all import IP, UDP, TCP, Raw, wrpcap, rdpcap
+import numpy as np
+from scapy.all import wrpcap, rdpcap
 
-from llm_client import LLMClient
+import reference_models
+from llm_client import LLMClient, MODEL_VARIANT
 from session_context import SessionContext
-from packet_model import GTP_U_Mutation
-from gtpu_scapy import build_gtpu_packet_from_mutation, MODEL_VARIANT
+from gtpu import GTP_U_Mutation
 from generate_llm_pcap import (
+    assemble_gpdu,
     create_web_browsing_stream,
     generate_timestamped_filename,
     _make_web_browsing_session,
     _UE_IP,
     _WEB_SERVER_IP,
     _WEB_SERVER_PORT,
+    _GNODEB_IP,
+    _UPF_IP,
 )
 
 
-def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, upf_ip: str,
+def _build_attack_packet(ctx: SessionContext, mutation: Dict,
                          sim_time: float, direction: str = "DL"):
     """Convert one LLM mutation dict into a timestamped Scapy wire packet.
 
@@ -48,45 +51,60 @@ def _build_attack_packet(ctx: SessionContext, mutation: Dict, gnodeb_ip: str, up
 
     if direction == "UL":
         inner_src, inner_dst = _UE_IP, _WEB_SERVER_IP
-        tcp_sport, tcp_dport = random.randint(1024, 65535), _WEB_SERVER_PORT
-        outer_src, outer_dst = gnodeb_ip, upf_ip
+        sport, dport = random.randint(1024, 65535), _WEB_SERVER_PORT
+        outer_src, outer_dst = _GNODEB_IP, _UPF_IP
     else:
         inner_src, inner_dst = _WEB_SERVER_IP, _UE_IP
-        tcp_sport, tcp_dport = _WEB_SERVER_PORT, random.randint(1024, 65535)
-        outer_src, outer_dst = upf_ip, gnodeb_ip
+        sport, dport = _WEB_SERVER_PORT, random.randint(1024, 65535)
+        outer_src, outer_dst = _UPF_IP, _GNODEB_IP
 
-    base_inner_payload = (
-        IP(
-            src=inner_src,
-            dst=inner_dst,
-            id=random.randint(0, 0xFFFF),
-            ttl=random.randint(52, 62),
-        )
-        / TCP(
-            sport=tcp_sport,
-            dport=tcp_dport,
-            flags="PA",
-            seq=random.randint(0, 0xFFFFFFFF),
-            ack=random.randint(400, 2000),
-        )
-    )
-    payload_size = mutation.get("payload_size") or 0
-    pad_len = max(0, payload_size - len(base_inner_payload))
-    payload = base_inner_payload / Raw(load=os.urandom(pad_len)) if pad_len > 0 else base_inner_payload
-
-    gtp_packet = build_gtpu_packet_from_mutation(gtp_mutation, payload=payload)
-    wire_packet = (
-        IP(
-            src=outer_src,
-            dst=outer_dst,
-            tos=gtp_mutation.outer_dscp << 2,
-            id=random.randint(0, 0xFFFF),
-        )
-        / UDP(sport=2152, dport=2152)
-        / gtp_packet
+    wire_packet = assemble_gpdu(
+        gtp_mutation, inner_src=inner_src, inner_dst=inner_dst, sport=sport, dport=dport,
+        seq=random.randint(0, 0xFFFFFFFF), ack=random.randint(400, 2000), flags="PA",
+        ttl=random.randint(52, 62), payload_size=mutation.get("payload_size") or 0,
+        outer_src=outer_src, outer_dst=outer_dst,
     )
     wire_packet.time = sim_time
     return wire_packet
+
+
+def _script_attack_burst(llm, ctx, direction, burst_size, duration_sec, max_packets, rng):
+    """Rotates the same three violation dimensions the LLM campaign uses (DL: QFI/RQI/DSCP; UL: QFI
+    only), with benign-like payload/timing drawn from 5G-NIDD so only the QoS
+    marking is anomalous."""
+    active = ctx.active_qfis[0]
+    unauth = [q for q in (2, 7, 9, 11, 13) if q not in ctx.active_qfis] or [max(ctx.active_qfis) + 1]
+    dims = ("qfi",) if direction == "UL" else ("qfi", "rqi", "dscp")
+    scalars = reference_models.sample_benign_flow_scalars(max_packets, rng)
+    out, elapsed = [], 0.0
+    for i in range(max_packets):
+        if duration_sec is not None:
+            if elapsed >= duration_sec:
+                break
+        elif len(out) >= (burst_size or 100):
+            break
+        dim = dims[i % len(dims)]
+        pdu_type = 1 if direction == "UL" else 0
+        if dim == "qfi":
+            qfi, rqi, dscp = unauth[i % len(unauth)], 0, ctx.dscp_marking
+            reason = f"rule-based script: QFI {qfi} outside active set {ctx.active_qfis}"
+        elif dim == "rqi":
+            qfi, rqi, dscp = active, 1, ctx.dscp_marking
+            reason = "rule-based script: RQI=1 outside reflective-QoS allow-list"
+        else:
+            qfi, rqi, dscp = active, 0, 18
+            reason = "rule-based script: outer DSCP 18 != session DSCP"
+        iat = min(9000.0, max(3000.0, float(scalars["iat_ms"][i]))) if scalars else 5000.0
+        payload = min(1400, int(max(64, scalars["payload"][i]))) if scalars else 1200
+        raw = {"extension_headers": [{"type": 133, "pdu_type": pdu_type, "qfi": qfi, "rqi": rqi, "ppi": 0}],
+               "outer_dscp": dscp, "payload_size": payload, "inter_arrival_ms": iat, "reasoning": reason}
+        if not out:
+            raw["injection_fraction"], raw["campaign_size"] = 0.5, burst_size or max_packets
+        m = llm._sanitize_mutation(raw, ctx, direction=direction)
+        if m:
+            out.append(m)
+            elapsed += iat / 1000.0
+    return out
 
 
 def create_injected_attack_stream(
@@ -96,28 +114,21 @@ def create_injected_attack_stream(
     injection_fraction: Optional[float] = None,
     direction: str = "DL",
     output_dir: str = "pcap_files",
-    gnodeb_ip: str = "192.168.100.10",
-    upf_ip: str = "192.168.100.20",
     model_name: str = MODEL_VARIANT,
     backend: str = "ollama",
     max_output_tokens: Optional[int] = None,
     llm_batch_size: int = 200,
     background_max_packets: Optional[int] = None,
     attack_max_packets: int = 500,
+    background_num_ues: int = 1,
+    generation_mode: str = "llm",
 ) -> tuple:
     """Generate a benign 5QI 6 background stream via LLM batch calls and
     inject one LLM-generated qfi_qer_mismatch attack campaign into it.
 
-    Attack length is set by (in precedence): attack_duration_minutes (keep
-    generating until that many minutes of the campaign's own timing is covered,
-    capped at attack_max_packets since each attack packet is one API call),
-    else burst_size packets, else — if both are None — the model's own
-    campaign_size. injection_fraction=None likewise lets the model choose where
-    in the background timeline to strike. Pass explicit values to pin a run.
-
-    Both the background and the attack packets belong to the SAME session
-    (same TEID/QFI) — the attack represents a compromised/malicious flow
-    riding the same tunnel, not a separate unrelated session.
+    The attack rides UE 0's session (TEID/IP), so with background_num_ues > 1
+    the compromised UE is hidden inside a realistic UPF crowd, the attack is one malicious flow among many innocent sessions, not a
+    lone stream.
 
     Returns:
         tuple: (path_to_pcap_file, path_to_telemetry_json)
@@ -137,24 +148,31 @@ def create_injected_attack_stream(
 
     benign_pcap, _ = create_web_browsing_stream(
         duration_minutes=background_duration_minutes, output_dir=output_dir,
-        gnodeb_ip=gnodeb_ip, upf_ip=upf_ip, max_packets=background_max_packets,
+        max_packets=background_max_packets,
         model_name=model_name, backend=backend, max_output_tokens=max_output_tokens,
-        llm_batch_size=llm_batch_size,
+        llm_batch_size=llm_batch_size, num_ues=background_num_ues,
+        generation_mode="sampled" if generation_mode == "script" else "llm",
     )
     benign_packets = rdpcap(benign_pcap)
     if not benign_packets:
         raise RuntimeError(f"Background stream {benign_pcap} produced no packets.")
 
-    print(f"\n[Attack Session Context — same session as background]")
+    print("\n[Attack Session Context — same session as background]")
     print(ctx.to_prompt_block())
     print()
 
-    mutations = llm.generate_burst(
-        ctx, burst_size=burst_size, duration_sec=attack_duration_sec,
-        direction=direction, max_retries_per_pkt=3, duration_max_packets=attack_max_packets,
-    )
+    if generation_mode == "script":
+        mutations = _script_attack_burst(
+            llm, ctx, direction, burst_size, attack_duration_sec,
+            attack_max_packets, np.random.default_rng(),
+        )
+    else:
+        mutations = llm.generate_burst(
+            ctx, burst_size=burst_size, duration_sec=attack_duration_sec,
+            direction=direction, max_retries_per_pkt=3, duration_max_packets=attack_max_packets,
+        )
     if not mutations:
-        raise RuntimeError("LLM failed to generate any attack packets for this campaign.")
+        raise RuntimeError(f"{generation_mode} generator produced no attack packets for this campaign.")
 
     if injection_fraction is None:
         model_fraction = mutations[0].get("injection_fraction")
@@ -171,13 +189,19 @@ def create_injected_attack_stream(
           f"(t={injection_time:.2f}s, injection_fraction={injection_fraction:.3f})\n")
 
     attack_packets = []
+    schema_invalid_skipped = 0
     sim_time = injection_time
     for i, mutation in enumerate(mutations, start=1):
-        sim_time += (mutation.get("inter_arrival_ms") or 20.0) / 1000.0
-        attack_packets.append(_build_attack_packet(ctx, mutation, gnodeb_ip, upf_ip, sim_time, direction=direction))
-        qfi = mutation["extension_headers"][0]["qfi"]
+        sim_time += (mutation.get("inter_arrival_ms") or 5000.0) / 1000.0
+        headers = mutation.get("extension_headers") or [{}]
+        qfi = headers[0].get("qfi")
+        if not mutation.get("raw_schema_valid"):
+            schema_invalid_skipped += 1
+            print(f"  Attack pkt #{i} | qfi={qfi} | raw_schema_valid=False -> SKIPPED (unserializable, counted)")
+            continue
+        attack_packets.append(_build_attack_packet(ctx, mutation, sim_time, direction=direction))
         is_violation = mutation["semantic_precision"]["is_semantically_anomalous"]
-        print(f"  Attack pkt #{i} | qfi={qfi:2d} | raw_schema_valid={mutation['raw_schema_valid']} | policy_violation={is_violation}")
+        print(f"  Attack pkt #{i} | qfi={qfi:2d} | raw_schema_valid=True | policy_violation={is_violation}")
 
     attack_ids = {id(p) for p in attack_packets}
     combined = sorted(list(benign_packets) + attack_packets, key=lambda p: float(p.time))
@@ -201,13 +225,16 @@ def create_injected_attack_stream(
     telemetry_data = {
         "experiment_type": "benign_plus_injected_qfi_qer_mismatch_attack",
         "attack_direction": direction,
-        "model_name": model_name,
+        "model_name": "rule-based-script" if generation_mode == "script" else model_name,
         "timestamp": datetime.now().isoformat(),
         "pcap_file": pcap_filename,
         "background_pcap_file": benign_pcap,
         "background_packet_count": len(benign_packets),
         "attack_burst_size_requested": requested_burst_size,
         "attack_burst_size_generated": len(mutations),
+        "attack_schema_valid_injected": len(attack_packets),
+        "attack_schema_invalid_skipped": schema_invalid_skipped,
+        "attack_schema_valid_rate": round(len(attack_packets) / len(mutations), 3) if mutations else 0.0,
         "attack_duration_minutes": attack_duration_minutes,
         "injection_fraction": injection_fraction,
         "injection_index": injection_index,
@@ -237,8 +264,10 @@ def create_injected_attack_stream(
     print(f" PCAP file                : {pcap_filename}")
     print(f" Telemetry JSON           : {json_filename}")
     print(f" Background packets       : {len(benign_packets)}")
-    print(f" Attack packets injected  : {len(mutations)}/{requested_burst_size}")
-    print(f" Policy violations        : {policy_violation_hits}/{len(mutations)} attack packets")
+    print(f" Attack generated         : {len(mutations)} mutations")
+    print(f" Schema-valid injected    : {len(attack_packets)}/{len(mutations)} "
+          f"({schema_invalid_skipped} malformed skipped, rate={telemetry_data['attack_schema_valid_rate']})")
+    print(f" Policy violations        : {policy_violation_hits}/{len(mutations)} generated mutations")
     print(
         f" LLM API calls            : {llm.call_count} "
         f"({llm.total_prompt_tokens} prompt / {llm.total_completion_tokens} completion tokens)"
@@ -267,6 +296,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-output-tokens", type=int, default=None)
     parser.add_argument("--llm-batch-size", type=int, default=200, help="Packets requested per background LLM batch call (default: 200 — tested to sustain diversity/consistency across a single call).")
     parser.add_argument("--background-max-packets", type=int, default=None, help="Cap on background LLM-generated arrivals (not wire packets/segments), to bound LLM call cost (default: unbounded).")
+    parser.add_argument("--background-num-ues", type=int, default=1, help="Number of concurrent benign UEs in the background crowd (default: 1). The attack rides UE 0; >1 hides the compromised UE among innocent sessions, the way a real UPF sees many UEs. Cost scales with N.")
+    parser.add_argument("--generation-mode", choices=["llm", "script"], default="llm", help="Attack generator: 'llm' (default, openai/ollama) or 'script' (rule-based, no LLM — the non-LLM baseline; background is auto-sampled so the whole run is LLM-free).")
     args = parser.parse_args()
 
     create_injected_attack_stream(
@@ -282,4 +313,6 @@ if __name__ == "__main__":
         llm_batch_size=args.llm_batch_size,
         attack_max_packets=args.attack_max_packets,
         background_max_packets=args.background_max_packets,
+        background_num_ues=args.background_num_ues,
+        generation_mode=args.generation_mode,
     )

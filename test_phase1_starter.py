@@ -4,8 +4,9 @@
 import pytest
 from llm_client import LLMClient
 from session_context import SessionContext
-from packet_model import GTP_U_Mutation, ExtensionHeader
-from gtpu_scapy import (
+from gtpu import (
+    GTP_U_Mutation,
+    ExtensionHeader,
     build_gtpu_packet,
     build_gtpu_packet_from_mutation,
     GTPUPDUSessionContainer,

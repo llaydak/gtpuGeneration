@@ -4,27 +4,6 @@ Unlike generate_attack_pcap.py (which writes a pcap), this sends the attack
 packet ONTO the wire so a real gtp5g UPF actually processes it, and reports
 whether the UPF *enforced* the unauthorized QFI or *forwarded* it.
 
-Transport: the GTP-U packet is sent over a plain UDP socket to the UPF's N3
-IP:2152. The host routes there over the N3 bridge, so this needs NO root. The
-outer source IP is the host's bridge IP rather than the gNB's — which is fine,
-because free5GC's uplink PDR matches on TEID (+ N3 interface), not on the outer
-source address. What rides inside is what matters:
-
-    GTP-U(TEID = live uplink TEID)                 # so the UPF's UL PDR accepts it
-      PDU Session Container(pdu_type=1, QFI = <unauthorized>)
-        IP(src = UE IP, dst = probe dst) / ICMP echo-request (unique id)
-
-Verdict: the inner ICMP echo-request travels UE->DN. If the UPF forwards it
-(does NOT verify the uplink QFI against the authorized set), the DN's reply is
-reverse-NATed and encapsulated back downlink toward the gNB, visible on the N3
-bridge with our unique ICMP id. Seeing that reply == forwarded (enforcement
-gap). No reply == dropped/enforced.
-
-Auto-verdict needs to sniff the bridge (root). Run with sudo for a one-shot
-verdict; or run without sudo to just send, and watch the reply yourself with:
-    sudo tshark -i br-free5gc -f "udp port 2152" -Y icmp \
-      -T fields -e ip.src -e ip.dst -e icmp.type -e icmp.id
-
     sudo ./upfvenv/bin/python3 inject_qfi_attack.py --qfi 7   # attack
     sudo ./upfvenv/bin/python3 inject_qfi_attack.py --qfi 1   # benign control (should FORWARD)
 """
@@ -35,9 +14,8 @@ import socket
 import time
 
 from scapy.all import IP, ICMP, AsyncSniffer
-from scapy.contrib.gtp import GTP_U_Header  # noqa: F401  (ensures contrib bind_layers load)
 
-from gtpu_scapy import build_gtpu_packet
+from gtpu import build_gtpu_packet 
 
 
 def build_gtpu_bytes(ue_ip, dst_ip, teid, qfi, icmp_id, icmp_seq):
@@ -113,7 +91,7 @@ def main():
     if replies:
         print(f"  VERDICT: FORWARDED  -> UPF did NOT enforce the uplink QFI (QFI={args.qfi} accepted). Enforcement gap.")
     else:
-        print(f"  VERDICT: NO REPLY   -> UPF dropped/enforced it (or DN unreachable). Try --qfi 1 to confirm path+method.")
+        print("  VERDICT: NO REPLY   -> UPF dropped/enforced it (or DN unreachable). Try --qfi 1 to confirm path+method.")
 
 
 if __name__ == "__main__":
