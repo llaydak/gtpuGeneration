@@ -1,0 +1,12 @@
+# GTP-U wire building and PCAP I/O
+scapy>=2.7.0
+# Reference distributions, sampling, KS scoring
+numpy>=2.5.0
+# LLM backend abstraction (ollama / openai)
+litellm>=1.92.0
+# .env loading for backend URL / model / API key
+python-dotenv>=1.2.0
+# Goodness-of-fit plots
+matplotlib>=3.11.0
+# Unit tests
+pytest>=9.1.0
